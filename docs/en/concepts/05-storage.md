@@ -4,33 +4,21 @@ OpenViking uses a dual-layer storage architecture that separates content storage
 
 ## Overview
 
-```
-┌─────────────────────────────────────────┐
-│          VikingFS (URI Abstraction)      │
-│    URI Mapping · Hierarchical Access     │
-└────────────────┬────────────────────────┘
-        ┌────────┴────────┐
-        │                 │
-┌───────▼────────┐  ┌─────▼───────────┐
-│  Vector Index  │  │      AGFS       │
-│ (Semantic      │  │ (Content        │
-│  Search)       │  │  Storage)       │
-└────────────────┘  └─────────────────┘
-```
+<StorageLayersDiagram />
 
 ## Dual-Layer Storage
 
 | Layer | Responsibility | Content |
 |-------|----------------|---------|
 | **AGFS** | Content storage | L0/L1/L2 full content, multimedia files |
-| **Vector Index** | Index storage | URIs, vectors, metadata (no file content) |
+| **Vector Index** | Index storage | URIs, vectors, metadata, and retrieval text such as abstracts |
 
 ### Design Benefits
 
-1. **Clear responsibilities**: Vector index handles retrieval, AGFS handles storage
-2. **Memory optimization**: Vector index doesn't store file content, saving memory
-3. **Single data source**: All content read from AGFS; vector index only stores references
-4. **Independent scaling**: Vector index and AGFS can scale separately
+AGFS holds the source files. The vector index stores what retrieval needs, including URI references, vectors, metadata, and abstracts. Memory records store their body text in the abstract field, capped at 50,000 bytes, so the vector index can contain readable text.
+
+The two backends can be configured separately. File APIs read from AGFS, while retrieval can return indexed text without rereading every source file. Backups and access controls should account for both stores.
+
 Note: AGFS has been rewritten as a Rust implementation (RAGFS)
 
 ## VikingFS Virtual Filesystem
@@ -83,7 +71,7 @@ For the conceptual model, see [Multi-Write Storage](./14-multi-write-storage.md)
 
 ### Directory Structure
 
-Each context directory follows a unified structure:
+A directory after semantic processing commonly has the following structure. Summary sidecars may be absent before processing or when only L0 has been created:
 
 ```
 viking://resources/docs/auth/
@@ -95,6 +83,20 @@ viking://resources/docs/auth/
 ## Vector Index
 
 The vector index stores semantic indices, supporting vector search and scalar filtering.
+
+### Local Record Format Compatibility
+
+The local backend packs non-vector fields into a JSON payload. New candidate records and delta
+logs store that payload as `text` with a 32-bit byte length, removing the previous 65,535-byte
+limit on the combined JSON. The payload is preserved without truncation.
+
+New records carry a format version. Existing unversioned records remain readable, and updates
+write the new format; no full database rewrite, index rebuild, or embedding recomputation is
+required for this format upgrade. Delta replay also accepts both formats.
+
+This compatibility is one-way: older releases cannot read the new record format. To downgrade,
+restore a backup taken before the first write with the new format; changing the executable alone
+is insufficient.
 
 ### Context Collection Schema
 
@@ -115,6 +117,8 @@ The vector index stores semantic indices, supporting vector search and scalar fi
 
 ### Index Strategy
 
+Example index metadata; available settings depend on the selected vector backend:
+
 ```python
 index_meta = {
     "IndexType": "flat_hybrid",  # Hybrid index
@@ -133,19 +137,19 @@ index_meta = {
 
 ## Vector Synchronization
 
-VikingFS automatically maintains consistency between vector index and AGFS.
+Filesystem operations coordinate changes to files and vector records. Summary refreshes can continue asynchronously, and failures can leave partial changes; see the [filesystem API](../api/03-filesystem.md) for operation-specific behavior. The examples below use an initialized synchronous Python SDK client.
 
 ### Delete Sync
 
 ```python
-viking_fs.rm("viking://resources/docs/auth", recursive=True)
+client.rm("viking://resources/docs/auth", recursive=True)
 # Automatically deletes all records with this URI prefix from vector index
 ```
 
 ### Move Sync
 
 ```python
-viking_fs.mv(
+client.mv(
     "viking://resources/docs/auth",
     "viking://resources/docs/authentication"
 )

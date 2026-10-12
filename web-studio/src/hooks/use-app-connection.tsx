@@ -237,8 +237,11 @@ export function resolveConnectionRoleProbeState({
   role: ConnectionRole
   shouldProbe: boolean
 } {
-  if (!baseUrl) {
+  if (!baseUrl || serverMode === 'offline') {
     return { isLoading: false, role: 'unknown', shouldProbe: false }
+  }
+  if (serverMode === 'checking') {
+    return { isLoading: true, role: 'unknown', shouldProbe: false }
   }
   if (serverMode === 'dev') {
     return { isLoading: false, role: 'root', shouldProbe: false }
@@ -307,9 +310,10 @@ function createConnectionHealthHeaders(
     credential === 'data'
       ? connection.apiKey || connection.adminApiKey
       : connection.adminApiKey || connection.apiKey
-  if (apiKey) {
-    headers['X-API-Key'] = apiKey
+  if (!apiKey) {
+    return headers
   }
+  headers['X-API-Key'] = apiKey
   if (connection.accountId) {
     headers['X-OpenViking-Account'] = connection.accountId
   }
@@ -729,11 +733,11 @@ export function AppConnectionProvider({
           throw createConnectionError('credentialMismatch')
         }
 
-        if (pathname === '/playground') {
+        if (pathname === '/filesystem') {
           await navigate({
             replace: true,
             search: { upload: false },
-            to: '/playground',
+            to: '/filesystem',
           })
         }
         commitConnection({

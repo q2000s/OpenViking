@@ -106,6 +106,8 @@ ov add-resource https://raw.githubusercontent.com/volcengine/OpenViking/refs/hea
 ov ls viking://resources
 ov tree viking://resources -L 2
 ov read viking://resources/...
+# Read lines 11 through 15 (zero-based offset; limit -1 reads to the end)
+ov read viking://resources/... --offset 10 --limit 5
 
 # Retrieve context
 ov find "what is openviking"
@@ -137,7 +139,7 @@ Run `ov --help` and `ov <command> --help` for the exact command surface of your 
 - `get` - Download a file to a local path.
 
 ```bash
-# The destination parent must exist and the destination itself must not exist.
+# The destination parent must exist. Existing files are overwritten; directories are merged.
 ov cp viking://resources/docs/guide.md viking://resources/archive/guide-copy.md
 ov cp -r viking://resources/docs viking://resources/docs-backup
 ```

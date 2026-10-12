@@ -4,6 +4,8 @@ import uuid
 from pathlib import Path
 from unittest.mock import MagicMock
 
+from openviking.pyagfs import AGFSNotFoundError
+
 
 class MockLocalAGFS:
     """
@@ -34,6 +36,7 @@ class MockLocalAGFS:
         self._resolve(path).mkdir(parents=parents, exist_ok=exist_ok)
 
     def ls(self, path, ctx=None, **kwargs):
+        """List test entries with the same sorting and pagination contract as RagFS."""
         p = self._resolve(path)
         if not p.exists():
             return []
@@ -49,7 +52,28 @@ class MockLocalAGFS:
                     "uri": f"viking://{path}/{item.name}".replace("//", "/"),
                 }
             )
-        return res
+        sort_by = kwargs.get("sort_by")
+        reverse = kwargs.get("sort_order", "asc") == "desc"
+        if sort_by:
+            key = (
+                (lambda entry: (str(entry["name"]).lower(), str(entry["name"])))
+                if sort_by == "name"
+                else (
+                    lambda entry: (
+                        entry["mtime"],
+                        str(entry["name"]).lower(),
+                        str(entry["name"]),
+                    )
+                )
+            )
+            directories = sorted(
+                (entry for entry in res if entry["isDir"]), key=key, reverse=reverse
+            )
+            files = sorted((entry for entry in res if not entry["isDir"]), key=key, reverse=reverse)
+            res = directories + files
+        offset = kwargs.get("offset", 0)
+        limit = kwargs.get("limit")
+        return res[offset:] if limit is None else res[offset : offset + limit]
 
     def glob_directory(
         self,
@@ -104,7 +128,7 @@ class MockLocalAGFS:
     def read_file(self, path, ctx=None, **kwargs):
         p = self._resolve(path)
         if not p.exists():
-            raise FileNotFoundError(path)
+            raise AGFSNotFoundError(path)
         return p.read_bytes()
 
     def read(self, path, ctx=None, **kwargs):
@@ -136,7 +160,7 @@ class MockLocalAGFS:
     def stat(self, path, ctx=None):
         p = self._resolve(path)
         if not p.exists():
-            raise FileNotFoundError(path)
+            raise AGFSNotFoundError(path)
         s = p.stat()
         return {
             "size": s.st_size,

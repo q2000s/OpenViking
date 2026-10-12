@@ -264,6 +264,10 @@ export type BodyTempUploadApiV1ResourcesTempUploadPost = {
  */
 export type CommitRequest = {
     /**
+     * Override only Working Memory generation for this commit; null inherits policy.
+     */
+    enable_working_memory?: boolean | null;
+    /**
      * Keep Recent Count
      *
      * Number of most-recent messages to keep live after commit. Plugin's afterTurn path typically passes its configured value (default 10); compact path passes 0 to archive everything.
@@ -705,24 +709,6 @@ export type UpsertPrivacyConfigRequest = {
 };
 
 /**
- * UsedRequest
- *
- * Request model for recording usage.
- */
-export type UsedRequest = {
-    /**
-     * Contexts
-     */
-    contexts?: Array<string> | null;
-    /**
-     * Skill
-     */
-    skill?: {
-        [key: string]: unknown;
-    } | null;
-};
-
-/**
  * ValidationError
  */
 export type ValidationError = {
@@ -1074,7 +1060,7 @@ export type DeleteAdminAccountByAccountIdResponses = {
     /**
      * Successful Response
      */
-    200: unknown;
+    202: unknown;
 };
 
 export type GetAdminAccountIdUsersData = {
@@ -3332,54 +3318,6 @@ export type PostSessionIdMessagesResponses = {
     200: unknown;
 };
 
-export type PostSessionIdUsedData = {
-    body: UsedRequest;
-    headers?: {
-        /**
-         * X-Api-Key
-         */
-        'x-api-key'?: string | null;
-        /**
-         * Authorization
-         */
-        authorization?: string | null;
-        /**
-         * X-Openviking-Account
-         */
-        'X-OpenViking-Account'?: string | null;
-        /**
-         * X-Openviking-User
-         */
-        'X-OpenViking-User'?: string | null;
-    };
-    path: {
-        /**
-         * Session Id
-         *
-         * Session ID
-         */
-        session_id: string;
-    };
-    query?: never;
-    url: '/api/v1/sessions/{session_id}/used';
-};
-
-export type PostSessionIdUsedErrors = {
-    /**
-     * Validation Error
-     */
-    422: HttpValidationError;
-};
-
-export type PostSessionIdUsedError = PostSessionIdUsedErrors[keyof PostSessionIdUsedErrors];
-
-export type PostSessionIdUsedResponses = {
-    /**
-     * Successful Response
-     */
-    200: unknown;
-};
-
 export type GetStatsMemoriesData = {
     body?: never;
     headers?: {
@@ -4115,7 +4053,14 @@ export type GetTaskByTaskIdData = {
          */
         task_id: string;
     };
-    query?: never;
+    query?: {
+        /**
+         * Include Events
+         *
+         * Include recorded execution events
+         */
+        include_events?: boolean;
+    };
     url: '/api/v1/tasks/{task_id}';
 };
 
