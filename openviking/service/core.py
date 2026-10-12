@@ -515,6 +515,7 @@ class OpenVikingService:
         pdf_config = self._config.pdf
         should_preflight_mineru = (
             pdf_config.strategy == "mineru"
+            or pdf_config.strategy == "mineru_first"
             or (pdf_config.strategy == "auto" and pdf_config.mineru_endpoint is not None)
         ) and pdf_config.mineru_api_mode != "async"
 

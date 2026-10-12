@@ -859,7 +859,7 @@ PDF 解析配置。支持三种策略：`local`（本地 pdfplumber）、`mineru
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `strategy` | str | 解析策略：`local` / `mineru` / `auto`（默认 `auto`） |
+| `strategy` | str | 解析策略：`local` / `mineru` / `mineru_first` / `auto`（默认 `auto`） |
 | `mineru_endpoint` | str | MinerU API **base URL**（如自托管 `http://127.0.0.1:8000`，在线服务 `https://mineru.net/api/v4`） |
 | `mineru_timeout` | float | 请求/轮询超时秒数（默认 `300.0`） |
 | `mineru_bodys` | dict | MinerU API multipart form 参数（透传） |
@@ -873,6 +873,17 @@ PDF 解析配置。支持三种策略：`local`（本地 pdfplumber）、`mineru
 - **在线批量 API（`async`）**：`POST {mineru_endpoint}/extract/task/batch`（通过 `mineru_token` 做 Bearer 认证），轮询 `{mineru_endpoint}/extract-results/batch/{batch_id}` 至 `state=done`，下载 `full_zip_url` 并解包。
 
 默认 `mineru_api_mode=auto` 时自动识别协议形态：先尝试内联端点，返回 `404`（或任务式响应）即切换到任务流，存量自托管 v1 部署无需改配置。启动时的 `/health` 预检仅适用于 sync 形态（在线服务没有该端点）。
+
+**如何选择策略：**
+
+| `strategy` | 是否使用 MinerU | MinerU 失败时 | 是否必填 `mineru_endpoint` |
+|---|---|---|---|
+| `local` | 否 | — | 否 |
+| `mineru` | 始终使用 | 导入失败 | 是 |
+| `mineru_first` | 优先使用 | 回退到本地解析器 | 是 |
+| `auto` | 仅本地失败后使用 | 导入失败 | 否 |
+
+当远程转换值得额外延迟、但**绝不能阻塞导入**时，请使用 `mineru_first`：token 缺失、限流或服务故障都会让该文档降级为本地解析，而不是让整批导入失败。与 `mineru` 不同，`mineru_first` 不会把 MinerU 的问题变成启动问题——预检结果仅作告警，回退按文档逐个发生。解析结果元数据中的 `pdf_strategy_effective`（值为 `mineru` 或 `local`）会记录实际走的路径，便于事后审计转换质量。
 
 **在线服务示例：**
 

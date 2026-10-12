@@ -60,9 +60,7 @@ class _FakeResponse:
 
     def raise_for_status(self):
         if self.status_code >= 400:
-            raise httpx.HTTPStatusError(
-                f"HTTP {self.status_code}", request=None, response=self
-            )
+            raise httpx.HTTPStatusError(f"HTTP {self.status_code}", request=None, response=self)
 
 
 class _RoutedClient:
@@ -160,7 +158,7 @@ def _patch_client(monkeypatch, client):
 
 
 def _parser(**overrides):
-    defaults = dict(strategy="mineru", mineru_endpoint=ENDPOINT)
+    defaults = {"strategy": "mineru", "mineru_endpoint": ENDPOINT}
     defaults.update(overrides)
     return PDFParser(PDFConfig(**defaults))
 
@@ -308,7 +306,11 @@ def _online_routes(zip_content=None):
         "code": 0,
         "data": {
             "extract_result": [
-                {"file_name": "doc.pdf", "state": "done", "full_zip_url": "https://cdn.example/result.zip"}
+                {
+                    "file_name": "doc.pdf",
+                    "state": "done",
+                    "full_zip_url": "https://cdn.example/result.zip",
+                }
             ]
         },
     }
@@ -351,7 +353,10 @@ async def test_online_task_failed_raises_with_detail(monkeypatch, pdf_path, tmp_
         BATCH_URL: [_FakeResponse(_online_create_payload())],
         poll: [
             _FakeResponse(
-                {"code": 0, "data": {"extract_result": [{"state": "failed", "err_msg": "quota exhausted"}]}}
+                {
+                    "code": 0,
+                    "data": {"extract_result": [{"state": "failed", "err_msg": "quota exhausted"}]},
+                }
             )
         ],
     }
@@ -429,3 +434,64 @@ def test_api_mode_validation_rejects_unknown_value():
 def test_api_mode_accepts_all_documented_values():
     for mode in ("auto", "sync", "async"):
         PDFConfig(strategy="mineru", mineru_endpoint=ENDPOINT, mineru_api_mode=mode).validate()
+
+
+# ---------------------------------------------------------------------------
+# mineru_first: prefer MinerU, degrade to the local parser instead of failing
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_mineru_first_uses_mineru_when_available(monkeypatch, pdf_path, tmp_path):
+    """MinerU-first takes the remote path when the endpoint answers."""
+    client = _RoutedClient({FILE_PARSE_URL: [_FakeResponse(_sync_payload())]})
+    parser = _parser(strategy="mineru_first", mineru_api_mode="sync")
+    _patch_client(monkeypatch, client)
+
+    md, meta = await parser._convert_to_markdown(pdf_path)
+
+    assert md.startswith("# Doc")
+    assert meta["strategy"] == "mineru"
+
+
+@pytest.mark.asyncio
+async def test_mineru_first_falls_back_to_local_on_mineru_failure(monkeypatch, pdf_path, tmp_path):
+    """The fallback path: MinerU raising must degrade to the local parser, not fail."""
+    client = _RoutedClient({FILE_PARSE_URL: []})
+    parser = _parser(strategy="mineru_first", mineru_api_mode="sync")
+    _patch_client(monkeypatch, client)
+
+    called = {}
+
+    async def fake_local(self, pdf_path, storage=None, resource_name=None):
+        called["yes"] = True
+        return "local markdown", {"strategy": "local"}
+
+    monkeypatch.setattr(PDFParser, "_convert_local", fake_local)
+
+    md, meta = await parser._convert_to_markdown(pdf_path)
+
+    assert called.get("yes") is True
+    assert md == "local markdown"
+    assert meta["strategy"] == "local"
+
+
+@pytest.mark.asyncio
+async def test_mineru_first_records_effective_strategy(monkeypatch, pdf_path, tmp_path):
+    """Operators must be able to tell which path actually ran."""
+    client = _RoutedClient({FILE_PARSE_URL: [_FakeResponse(_sync_payload())]})
+    parser = _parser(strategy="mineru_first", mineru_api_mode="sync")
+    _patch_client(monkeypatch, client)
+
+    _, meta = await parser._convert_to_markdown(pdf_path)
+
+    assert meta["strategy"] == "mineru"
+
+
+def test_mineru_first_is_a_valid_strategy():
+    PDFConfig(strategy="mineru_first", mineru_endpoint=ENDPOINT).validate()
+
+
+def test_mineru_first_requires_endpoint():
+    with pytest.raises(ValueError, match="mineru_endpoint"):
+        PDFConfig(strategy="mineru_first").validate()

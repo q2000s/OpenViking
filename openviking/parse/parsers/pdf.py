@@ -31,8 +31,8 @@ from openviking.parse.base import (
     lazy_import,
 )
 from openviking.parse.parsers.base_parser import BaseParser
-from openviking.utils.zip_safe import normalize_zip_filenames
 from openviking.utils.time_utils import parse_iso_datetime
+from openviking.utils.zip_safe import normalize_zip_filenames
 from openviking_cli.utils import get_logger
 from openviking_cli.utils.config.parser_config import PDFConfig
 
@@ -153,6 +153,11 @@ class PDFParser(BaseParser):
             result.parse_time = time.time() - start_time
             result.meta.update(conversion_meta)
             result.meta["pdf_strategy"] = self.config.strategy
+            # Under mineru_first the requested strategy and the path actually
+            # taken can differ, so record the effective one for operators.
+            effective = conversion_meta.get("strategy")
+            if effective:
+                result.meta["pdf_strategy_effective"] = effective
             result.meta["intermediate_markdown_length"] = len(markdown_content)
             result.meta["intermediate_markdown_preview"] = markdown_content[:500]
 
@@ -198,6 +203,16 @@ class PDFParser(BaseParser):
 
         elif self.config.strategy == "mineru":
             return await self._convert_mineru(pdf_path, resource_name=resource_name)
+
+        elif self.config.strategy == "mineru_first":
+            # MinerU is preferred, but any failure degrades to the local parser
+            # instead of failing the import. Unlike strategy="mineru", a
+            # missing or unreachable endpoint is never fatal here.
+            try:
+                return await self._convert_mineru(pdf_path, resource_name=resource_name)
+            except Exception as e:
+                logger.warning(f"MinerU conversion failed, falling back to local parser: {e}")
+                return await self._convert_local(pdf_path, resource_name=resource_name)
 
         elif self.config.strategy == "auto":
             # Try local first
@@ -736,9 +751,7 @@ class PDFParser(BaseParser):
             return "v2-tasks"
         if isinstance(data.get("batch_id"), str):
             return "online-batch"
-        if result.get("status") == "completed" and isinstance(
-            result.get("results"), dict
-        ):
+        if result.get("status") == "completed" and isinstance(result.get("results"), dict):
             return "v1-sync"
         return None
 
@@ -816,16 +829,26 @@ class PDFParser(BaseParser):
                         if mode == "sync" or flavor in (None, "v1-sync"):
                             meta["api_mode"] = "v1-sync"
                             return await self._convert_mineru_v1(
-                                result, pdf_path, meta,
-                                storage=storage, resource_name=resource_name,
+                                result,
+                                pdf_path,
+                                meta,
+                                storage=storage,
+                                resource_name=resource_name,
                             )
                         return await self._mineru_continue_task(
-                            client, result, meta, pdf_path,
-                            storage=storage, resource_name=resource_name,
+                            client,
+                            result,
+                            meta,
+                            pdf_path,
+                            storage=storage,
+                            resource_name=resource_name,
                         )
                 return await self._mineru_run_task_flow(
-                    client, meta, pdf_path,
-                    storage=storage, resource_name=resource_name,
+                    client,
+                    meta,
+                    pdf_path,
+                    storage=storage,
+                    resource_name=resource_name,
                 )
         except Exception as e:
             logger.error(f"MinerU API call failed: {e}")
@@ -850,9 +873,7 @@ class PDFParser(BaseParser):
                 raise
             flavor = self._mineru_response_flavor(result)
             if flavor in (None, kind):
-                return await self._mineru_continue_task(
-                    client, result, meta, pdf_path, **kwargs
-                )
+                return await self._mineru_continue_task(client, result, meta, pdf_path, **kwargs)
             errors.append(f"{url}: unexpected response shape")
         raise ValueError(
             "No MinerU task endpoint responded on "
@@ -896,7 +917,9 @@ class PDFParser(BaseParser):
             logger.info(f"MinerU task {task_id} submitted; polling {status_url}")
             deadline = time.monotonic() + self.config.mineru_timeout
             await self._mineru_poll(
-                client, status_url, deadline,
+                client,
+                status_url,
+                deadline,
                 done_when=lambda body: body.get("status") == "completed",
                 busy_when=lambda body: body.get("status") in ("pending", "processing"),
                 failure_detail=self._mineru_failure_detail,
@@ -909,24 +932,26 @@ class PDFParser(BaseParser):
             logger.info(f"MinerU online batch {batch_id} submitted; polling {poll_url}")
             deadline = time.monotonic() + self.config.mineru_timeout
             await self._mineru_poll(
-                client, poll_url, deadline,
+                client,
+                poll_url,
+                deadline,
                 done_when=self._mineru_online_done,
                 busy_when=self._mineru_online_busy,
                 failure_detail=self._mineru_online_failure_detail,
             )
-            zip_url = self._mineru_online_zip_url(
-                await self._mineru_get_json(client, poll_url)
-            )
+            zip_url = self._mineru_online_zip_url(await self._mineru_get_json(client, poll_url))
             if not zip_url:
                 raise ValueError(
-                    "MinerU online task completed but no zip url found in "
-                    f"{poll_url} response"
+                    f"MinerU online task completed but no zip url found in {poll_url} response"
                 )
 
         zip_bytes = await self._mineru_download_zip(client, zip_url)
         markdown_content, meta = self._mineru_unpack_zip(
-            zip_bytes, pdf_path, meta,
-            storage=storage, resource_name=resource_name,
+            zip_bytes,
+            pdf_path,
+            meta,
+            storage=storage,
+            resource_name=resource_name,
         )
         logger.info(f"MinerU {flavor} conversion: {len(markdown_content)} chars")
         return markdown_content, meta
@@ -938,8 +963,13 @@ class PDFParser(BaseParser):
         return base + (url or "")
 
     async def _mineru_poll(
-        self, client, url: str, deadline: float,
-        done_when, busy_when, failure_detail,
+        self,
+        client,
+        url: str,
+        deadline: float,
+        done_when,
+        busy_when,
+        failure_detail,
     ) -> None:
         """Poll until ``done_when`` holds; raise on failure or timeout."""
         last_state = None
@@ -954,9 +984,7 @@ class PDFParser(BaseParser):
                     last_state = state
                 await asyncio.sleep(3.0)
                 continue
-            raise ValueError(
-                f"MinerU task failed: {failure_detail(body)}"
-            )
+            raise ValueError(f"MinerU task failed: {failure_detail(body)}")
         raise TimeoutError(
             f"MinerU task did not finish within {self.config.mineru_timeout}s: {url}"
         )
@@ -1032,9 +1060,9 @@ class PDFParser(BaseParser):
         The archive layout follows the standard MinerU export: a markdown file
         (``full.md`` preferred) plus an ``images/`` directory it references.
         """
-        from openviking.utils.zip_safe import safe_extract_zip
-
         import zipfile
+
+        from openviking.utils.zip_safe import safe_extract_zip
 
         with tempfile.TemporaryDirectory(prefix="mineru-") as tmp:
             tmp_dir = Path(tmp)
@@ -1081,21 +1109,15 @@ class PDFParser(BaseParser):
                             filename=img.stem,
                             extension=img.suffix or ".png",
                         )
-                        repl[f"images/{img.name}"] = (
-                            image_path.relative_to(media_dir).as_posix()
-                        )
+                        repl[f"images/{img.name}"] = image_path.relative_to(media_dir).as_posix()
                     except Exception as img_err:
                         logger.warning(f"Failed to save MinerU image {img.name}: {img_err}")
 
             if repl:
                 ref_pattern = re.compile(
-                    "|".join(
-                        re.escape(ref) for ref in sorted(repl, key=len, reverse=True)
-                    )
+                    "|".join(re.escape(ref) for ref in sorted(repl, key=len, reverse=True))
                 )
-                markdown_content = ref_pattern.sub(
-                    lambda m: repl[m.group(0)], markdown_content
-                )
+                markdown_content = ref_pattern.sub(lambda m: repl[m.group(0)], markdown_content)
                 meta["images_saved"] = len(repl)
 
         return markdown_content, meta

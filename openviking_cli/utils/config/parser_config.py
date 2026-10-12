@@ -137,25 +137,26 @@ class ParserConfig:
 @dataclass
 class PDFConfig(ParserConfig):
     """
-    Configuration for PDF parsing.
+        Configuration for PDF parsing.
 
-    Supports three strategies:
+        Supports three strategies:
     - "local": Use pdfplumber for local PDF→Markdown conversion
     - "mineru": Use MinerU API for remote PDF→Markdown conversion
+    - "mineru_first": Try MinerU first, fall back to the local parser on failure
     - "auto": Try local first, fallback to MinerU if available
 
-    Attributes:
-        strategy: Parsing strategy ("local" | "mineru" | "auto")
-        mineru_endpoint: MinerU API endpoint URL
-        mineru_timeout: MinerU request timeout in seconds
-        mineru_bodys: Additional MinerU API multipart form fields
-        mineru_api_mode: MinerU protocol flavor — "auto" (detect from the
-            response shape), "sync" (self-hosted single-shot /file_parse) or
-            "async" (online task API: create task, poll, download zip)
-        mineru_token: Optional bearer token for the online MinerU API
+        Attributes:
+            strategy: Parsing strategy ("local" | "mineru" | "mineru_first" | "auto")
+            mineru_endpoint: MinerU API endpoint URL
+            mineru_timeout: MinerU request timeout in seconds
+            mineru_bodys: Additional MinerU API multipart form fields
+            mineru_api_mode: MinerU protocol flavor — "auto" (detect from the
+                response shape), "sync" (self-hosted single-shot /file_parse) or
+                "async" (online task API: create task, poll, download zip)
+            mineru_token: Optional bearer token for the online MinerU API
     """
 
-    strategy: str = "auto"  # "local" | "mineru" | "auto"
+    strategy: str = "auto"  # "local" | "mineru" | "mineru_first" | "auto"
 
     # MinerU API configuration
     mineru_endpoint: Optional[str] = None  # API endpoint URL
@@ -187,14 +188,16 @@ class PDFConfig(ParserConfig):
         super().validate()
 
         # Validate PDF-specific fields
-        if self.strategy not in ("local", "mineru", "auto"):
+        if self.strategy not in ("local", "mineru", "mineru_first", "auto"):
             raise ValueError(
-                f"Invalid strategy '{self.strategy}'. Must be 'local', 'mineru', or 'auto'"
+                f"Invalid strategy '{self.strategy}'. Must be 'local', 'mineru', "
+                f"'mineru_first', or 'auto'"
             )
 
-        if self.strategy == "mineru":
-            if not self.mineru_endpoint:
-                raise ValueError("mineru_endpoint is required when strategy='mineru'")
+        # mineru_first degrades to the local parser, so an endpoint is optional;
+        # mineru makes the whole parse depend on it.
+        if self.strategy in ("mineru", "mineru_first") and not self.mineru_endpoint:
+            raise ValueError("mineru_endpoint is required when strategy='mineru' or 'mineru_first'")
 
         if self.mineru_timeout <= 0:
             raise ValueError("mineru_timeout must be positive")

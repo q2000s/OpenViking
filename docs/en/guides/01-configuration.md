@@ -891,7 +891,7 @@ PDF parsing configuration. Three strategies are supported: `local` (local pdfplu
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `strategy` | str | Parsing strategy: `local` / `mineru` / `auto` (default `auto`) |
+| `strategy` | str | Parsing strategy: `local` / `mineru` / `mineru_first` / `auto` (default `auto`) |
 | `mineru_endpoint` | str | MinerU API **base URL** (e.g. `http://127.0.0.1:8000`, or `https://mineru.net/api/v4` for the online API) |
 | `mineru_timeout` | float | Request/polling timeout in seconds (default `300.0`) |
 | `mineru_bodys` | dict | MinerU API multipart form fields (passed through) |
@@ -905,6 +905,17 @@ PDF parsing configuration. Three strategies are supported: `local` (local pdfplu
 - **Online batch API (`async`)**: `POST {mineru_endpoint}/extract/task/batch` (Bearer-token auth via `mineru_token`), poll `{mineru_endpoint}/extract-results/batch/{batch_id}` until `state=done`, download `full_zip_url` and unpack.
 
 Under the default `mineru_api_mode=auto` the flavor is detected automatically: the inline endpoint is tried first and a `404` (or a task-shaped response) switches to the task flow, so existing self-hosted v1 deployments keep working without config changes. The startup `/health` preflight only applies to the sync flavor (the online service has no such endpoint).
+
+**Choosing a strategy:**
+
+| `strategy` | MinerU used? | On MinerU failure | `mineru_endpoint` required |
+|---|---|---|---|
+| `local` | no | n/a | no |
+| `mineru` | always | the import fails | yes |
+| `mineru_first` | yes, tried first | falls back to the local parser | yes |
+| `auto` | only if local fails | the import fails | optional |
+
+Use `mineru_first` when remote conversion is worth the extra latency and quality but must never block an import — a missing token, a rate limit, or an outage degrades the document to the local parser instead of failing the whole batch. Unlike `mineru`, `mineru_first` never turns a MinerU problem into a startup problem: the preflight result is advisory and the fallback happens per document. The parser records which path actually ran in the result metadata as `pdf_strategy_effective` (`mineru` or `local`), so you can audit conversion quality after the fact.
 
 **Online example:**
 
