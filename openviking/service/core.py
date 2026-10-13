@@ -654,7 +654,7 @@ class OpenVikingService:
         # first PDF import. Required for strategy="mineru"; advisory for "auto".
         pdf_config = self._config.pdf
         should_preflight_mineru = pdf_config.strategy == "mineru" or (
-            pdf_config.strategy == "auto" and pdf_config.mineru_endpoint is not None
+            pdf_config.strategy == "auto" and pdf_config.remote_enabled
         )
 
         if should_preflight_mineru and pdf_config.mineru_endpoint:
