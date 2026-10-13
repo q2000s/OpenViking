@@ -1047,12 +1047,23 @@ PDF 解析配置。支持三种策略：`local`（本地 pdfplumber）、`mineru
 
 | 参数 | 类型 | 说明 |
 |------|------|------|
-| `strategy` | str | 解析策略：`local` / `mineru` / `auto`（默认 `auto`） |
+| `strategy` | str | 解析策略：`local` / `mineru` / `mineru_first` / `auto`（默认 `auto`） |
 | `mineru_endpoint` | str | MinerU API **base URL**（如 `http://127.0.0.1:8000`） |
 | `mineru_timeout` | float | 请求超时秒数（默认 `300.0`） |
 | `mineru_bodys` | dict | MinerU API multipart form 参数 |
 
 **MinerU 协议**：同步调用 `POST {mineru_endpoint}/file_parse`，multipart 文件字段为 `files`，form 参数由 `mineru_bodys` 透传。
+
+**如何选择策略：**
+
+| `strategy` | 是否使用 MinerU | MinerU 失败时 | 是否必填 `mineru_endpoint` |
+|---|---|---|---|
+| `local` | 否 | — | 否 |
+| `mineru` | 始终使用 | 导入失败 | 是 |
+| `mineru_first` | 优先使用 | 回退到本地解析器 | 是 |
+| `auto` | 仅本地失败后使用 | 导入失败 | 否 |
+
+当远程转换值得额外延迟、但**绝不能阻塞导入**时，请使用 `mineru_first`：token 缺失、限流或服务故障都会让该文档降级为本地解析，而不是让整批导入失败。与 `mineru` 不同，`mineru_first` 不会把 MinerU 的问题变成启动问题——启动预检仅作告警，回退按文档逐个发生。解析结果元数据中的 `pdf_strategy_effective`（值为 `mineru` 或 `local`）会记录实际走的路径，便于事后审计转换质量。
 
 ### 外部解析 API（`parser_api`） {#parser-api}
 

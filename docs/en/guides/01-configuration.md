@@ -1052,12 +1052,23 @@ PDF parsing configuration. Three strategies are supported: `local` (local pdfplu
 
 | Parameter | Type | Description |
 |-----------|------|-------------|
-| `strategy` | str | Parsing strategy: `local` / `mineru` / `auto` (default `auto`) |
+| `strategy` | str | Parsing strategy: `local` / `mineru` / `mineru_first` / `auto` (default `auto`) |
 | `mineru_endpoint` | str | MinerU API **base URL** (e.g. `http://127.0.0.1:8000`) |
 | `mineru_timeout` | float | Request timeout in seconds (default `300.0`) |
 | `mineru_bodys` | dict | MinerU API multipart form fields |
 
 **MinerU protocol**: a synchronous `POST {mineru_endpoint}/file_parse` request with the PDF as the multipart `files` field; form parameters are passed through from `mineru_bodys`.
+
+**Choosing a strategy:**
+
+| `strategy` | MinerU used? | On MinerU failure | `mineru_endpoint` required |
+|---|---|---|---|
+| `local` | no | n/a | no |
+| `mineru` | always | the import fails | yes |
+| `mineru_first` | yes, tried first | falls back to the local parser | yes |
+| `auto` | only if local fails | the import fails | optional |
+
+Use `mineru_first` when remote conversion is worth the extra latency and quality but must never block an import — a missing token, a rate limit, or an outage degrades that document to the local parser instead of failing the batch. Unlike `mineru`, `mineru_first` never turns a MinerU problem into a startup problem: the startup preflight is advisory and the fallback happens per document. The result metadata records which converter actually ran as `pdf_strategy_effective` (`mineru` or `local`), so conversion quality can be audited after the fact.
 
 ### External parser API (`parser_api`) {#parser-api}
 

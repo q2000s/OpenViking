@@ -156,6 +156,11 @@ class PDFParser(BaseParser):
             result.parse_time = time.time() - start_time
             result.meta.update(conversion_meta)
             result.meta["pdf_strategy"] = self.config.strategy
+            # Under mineru_first the requested strategy and the path actually taken
+            # can differ, so record the effective one for operators.
+            effective = conversion_meta.get("strategy")
+            if effective:
+                result.meta["pdf_strategy_effective"] = effective
             result.meta["intermediate_markdown_length"] = len(markdown_content)
             result.meta["intermediate_markdown_preview"] = markdown_content[:500]
 
@@ -201,6 +206,16 @@ class PDFParser(BaseParser):
 
         elif self.config.strategy == "mineru":
             return await self._convert_mineru(pdf_path, resource_name=resource_name)
+
+        elif self.config.strategy == "mineru_first":
+            # MinerU is preferred, but any failure degrades to the local parser
+            # instead of failing the import. Unlike strategy="mineru", an
+            # unreachable endpoint is never fatal here.
+            try:
+                return await self._convert_mineru(pdf_path, resource_name=resource_name)
+            except Exception as e:
+                logger.warning(f"MinerU conversion failed, falling back to local: {e}")
+                return await self._convert_local(pdf_path, resource_name=resource_name)
 
         elif self.config.strategy == "auto":
             # Try local first
