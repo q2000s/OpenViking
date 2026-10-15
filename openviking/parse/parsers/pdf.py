@@ -22,7 +22,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Set, Tuple, Union
 
 from openviking.parse.base import (
     NodeType,
@@ -78,6 +78,17 @@ class PDFParser(BaseParser):
         """
         self.config = config or PDFConfig()
         self.config.validate()
+
+        # Remote-parse health, shared across documents parsed by this instance so a
+        # batch that hits a rate limit stops paying for doomed calls. Tuned for the
+        # hosted APIs: failures cluster, and a short cooldown is enough to ride out
+        # a quota window without committing the rest of the batch to local parsing.
+        self._remote_failures: Dict[str, int] = {}
+        self._remote_circuit_open: Set[str] = set()
+        self._remote_probe_at: Dict[str, float] = {}
+        self._remote_circuit_threshold = 3
+        self._remote_circuit_cooldown = 20.0
+        self._remote_degraded = 0
 
         # Lazy import MarkdownParser to avoid circular imports
         self._markdown_parser = None
@@ -162,6 +173,10 @@ class PDFParser(BaseParser):
             effective = conversion_meta.get("strategy")
             if effective:
                 result.meta["pdf_strategy_effective"] = effective
+            if self._remote_degraded:
+                # A batch that silently stopped reaching the remote parser is
+                # visible after the fact instead of only in the log.
+                result.meta["pdf_remote_degraded"] = self._remote_degraded
             result.meta["intermediate_markdown_length"] = len(markdown_content)
             result.meta["intermediate_markdown_preview"] = markdown_content[:500]
 
@@ -214,16 +229,70 @@ class PDFParser(BaseParser):
             # and the local parser is always the last resort. Adding a new external
             # parser should mean adding a provider entry, not a new strategy value.
             for name, convert in self._remote_converters():
+                if not self._remote_admit(name):
+                    self._remote_degraded += 1
+                    continue
                 try:
-                    return await convert(pdf_path, resource_name=resource_name)
+                    result = await convert(pdf_path, resource_name=resource_name)
                 except Exception as e:
+                    self._remote_record_failure(name, e)
+                    self._remote_degraded += 1
                     # A remote failure degrades this one document to local rather
                     # than failing the import.
                     logger.warning(f"{name} conversion failed, using local: {e}")
+                    continue
+                self._remote_record_success(name)
+                return result
             return await self._convert_local(pdf_path, resource_name=resource_name)
 
         else:
             raise ValueError(f"Unknown strategy: {self.config.strategy}")
+
+    def _remote_admit(self, name: str) -> bool:
+        """Whether this document may reach ``name``, or must skip it.
+
+        A provider that has failed ``threshold`` times in a row is circuit-broken:
+        every remaining document goes straight to local instead of paying for a call
+        that already failed the same way. Once ``cooldown`` has passed exactly one
+        document is let through as a probe, so a recovered service is picked up again
+        and a service that is still down costs a single call rather than the batch.
+        """
+        if name not in self._remote_circuit_open:
+            return True
+        if time.monotonic() - self._remote_probe_at.get(name, 0.0) < self._remote_circuit_cooldown:
+            return False
+        logger.info(f"{name} circuit half-open, probing with this document")
+        return True
+
+    def _remote_record_failure(self, name: str, exc: Exception) -> None:
+        """Count a failure and open the circuit once the threshold is reached.
+
+        A probe failure re-arms the cooldown from now, so a service that is still
+        down goes back to being skipped instead of being retried on every document.
+        """
+        self._remote_failures[name] = self._remote_failures.get(name, 0) + 1
+        if name in self._remote_circuit_open:
+            self._remote_probe_at[name] = time.monotonic()
+            logger.warning(
+                f"{name} still failing while half-open ({exc}); "
+                f"circuit re-armed for another {self._remote_circuit_cooldown:.0f}s"
+            )
+            return
+        if self._remote_failures[name] >= self._remote_circuit_threshold:
+            self._remote_circuit_open.add(name)
+            self._remote_probe_at[name] = time.monotonic()
+            logger.warning(
+                f"{name} failed {self._remote_failures[name]} times in a row ({exc}); "
+                f"routing the rest of this batch to local for {self._remote_circuit_cooldown:.0f}s"
+            )
+
+    def _remote_record_success(self, name: str) -> None:
+        """A provider that answered is healthy again; drop all of its breaker state."""
+        if name in self._remote_circuit_open:
+            logger.info(f"{name} recovered, circuit closed")
+        self._remote_failures.pop(name, None)
+        self._remote_probe_at.pop(name, None)
+        self._remote_circuit_open.discard(name)
 
     def _remote_converters(self) -> List[Tuple[str, Any]]:
         """External converters this config enables, in the order they should be tried.

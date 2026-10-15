@@ -912,3 +912,168 @@ def test_parse_records_the_effective_strategy(monkeypatch, pdf_path):
     result = asyncio.run(parser.parse(pdf_path))
     assert result.meta["pdf_strategy"] == "auto"
     assert result.meta["pdf_strategy_effective"] == "mineru"
+
+
+# ---------------------------------------------------------------------------
+# remote circuit breaker
+# ---------------------------------------------------------------------------
+
+
+class _BreakerClient:
+    """Remote converter whose success can be toggled per document."""
+
+    def __init__(self):
+        self.up = False
+        self.calls = 0
+
+    async def __call__(self, pdf_path, resource_name=None):
+        self.calls += 1
+        if not self.up:
+            raise RuntimeError("remote down")
+        return "remote markdown", {"strategy": "mineru"}
+
+
+def _breaker_parser():
+    from openviking_cli.utils.config.parser_config import PDFConfig
+
+    return PDFParser(PDFConfig(strategy="auto", mineru_endpoint="https://mineru.example"))
+
+
+async def _stub_local(self, pdf_path, storage=None, resource_name=None):
+    return "local markdown", {"strategy": "local"}
+
+
+def _run_batch(parser, remote, n, pdf_path):
+    """Parse n documents and report the effective strategy of each."""
+    parser._remote_converters = lambda: [("MinerU", remote)]
+    parser._convert_local = _stub_local.__get__(parser, type(parser))
+    out = []
+    for _ in range(n):
+        _, meta = asyncio.run(parser._convert_to_markdown(pdf_path))
+        out.append(meta.get("strategy"))
+    return out
+
+
+def test_circuit_opens_and_the_rest_of_the_batch_skips_remote(pdf_path):
+    parser = _breaker_parser()
+    parser._remote_circuit_threshold = 3
+    parser._remote_circuit_cooldown = 10_000.0  # stay open for this batch
+    remote = _BreakerClient()
+
+    effective = _run_batch(parser, remote, 10, pdf_path)
+
+    assert effective.count("local") == 10
+    # only the documents up to the threshold paid for a doomed call
+    assert remote.calls == 3, remote.calls
+    # all ten documents fell back: three on the failure, seven on the open circuit
+    assert parser._remote_degraded == 10
+
+
+def test_circuit_half_opens_once_the_cooldown_passes_and_closes_on_success(pdf_path):
+    parser = _breaker_parser()
+    parser._remote_circuit_threshold = 2
+    parser._remote_circuit_cooldown = 10_000.0
+    remote = _BreakerClient()
+
+    _run_batch(parser, remote, 4, pdf_path)
+    assert "MinerU" in parser._remote_circuit_open
+    calls_while_open = remote.calls
+
+    # let the cooldown elapse, then bring the service back
+    parser._remote_circuit_cooldown = 0.0
+    remote.up = True
+
+    effective = _run_batch(parser, remote, 2, pdf_path)
+
+    assert "MinerU" not in parser._remote_circuit_open
+    assert effective == ["mineru", "mineru"]
+    assert remote.calls == calls_while_open + 2
+
+
+def test_a_failing_probe_rearms_the_cooldown_instead_of_retrying_every_document(pdf_path):
+    """Regression: a half-open probe that fails must re-arm, not hammer.
+
+    With a threshold of 1 and a cooldown of 3 documents, a probe failure that did
+    not reset the breaker produced [1, 0, 0, 1, 1, 1] -- a remote call per
+    document again, which is exactly what the breaker exists to prevent.
+    """
+    parser = _breaker_parser()
+    parser._remote_circuit_threshold = 1
+    remote = _BreakerClient()
+
+    calls = []
+    real_admit = type(parser)._remote_admit.__get__(parser, type(parser))
+
+    def _admit(name):
+        allowed = real_admit(name)
+        calls.append(1 if allowed else 0)
+        return allowed
+
+    # document 1 fails and opens the circuit
+    parser._remote_admit = _admit
+    remote_ = _BreakerClient()
+    _run_batch(parser, remote_, 1, pdf_path)
+    assert calls == [1]
+    assert "MinerU" in parser._remote_circuit_open
+
+    # cooldown expires, so one probe gets through; it fails again
+    parser._remote_circuit_cooldown = 0.0
+    calls.clear()
+    _run_batch(parser, remote_, 1, pdf_path)
+    parser._remote_admit = real_admit
+    assert calls == [1], "the probe should have been let through"
+    assert "MinerU" in parser._remote_circuit_open
+
+    # the next document must be skipped: the probe re-armed the cooldown
+    parser._remote_circuit_cooldown = 10_000.0
+    before = remote_.calls
+    _run_batch(parser, remote_, 4, pdf_path)
+    assert remote_.calls == before, "no remote call may happen while the circuit is armed"
+
+
+def test_breaker_state_is_cleared_after_a_success(pdf_path):
+    parser = _breaker_parser()
+    parser._remote_circuit_threshold = 1
+    parser._remote_circuit_cooldown = 0.0
+    remote = _BreakerClient()
+
+    _run_batch(parser, remote, 1, pdf_path)
+    assert "MinerU" in parser._remote_circuit_open
+
+    remote.up = True
+    _run_batch(parser, remote, 1, pdf_path)
+    assert not parser._remote_circuit_open
+    assert not parser._remote_failures
+
+
+def test_degraded_count_is_exposed_on_the_parse_result(monkeypatch, pdf_path):
+    from openviking.parse.base import NodeType, ResourceNode, create_parse_result
+
+    class _MD:
+        async def parse_content(self, content, **kw):
+            return create_parse_result(
+                root=ResourceNode(type=NodeType.ROOT),
+                source_path=kw.get("source_path", ""),
+                source_format="pdf",
+                parser_name="MarkdownParser",
+                parse_time=0.0,
+            )
+
+    class _Storage:
+        media_dir = Path("/media")
+
+    parser = _breaker_parser()
+    parser._remote_circuit_threshold = 1
+    parser._remote_circuit_cooldown = 10_000.0
+    remote = _BreakerClient()
+    monkeypatch.setattr(type(parser), "_remote_converters", lambda self: [("MinerU", remote)])
+    monkeypatch.setattr(type(parser), "_convert_local", _stub_local)
+    monkeypatch.setattr(type(parser), "_get_markdown_parser", lambda self: _MD())
+    monkeypatch.setattr(
+        "openviking_cli.utils.storage.get_storage", lambda: _Storage(), raising=False
+    )
+
+    result = asyncio.run(parser.parse(pdf_path))
+    assert result.meta["pdf_strategy"] == "auto"
+    assert result.meta["pdf_strategy_effective"] == "local"
+    assert result.meta["pdf_remote_degraded"] == 1
