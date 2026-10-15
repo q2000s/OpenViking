@@ -444,3 +444,471 @@ def test_self_hosted_images_are_saved_and_references_rewritten(monkeypatch, pdf_
     # the reference must now resolve to where the image was actually written
     assert "images/figure.png" not in text
     assert "math/figure.png" in text
+
+
+# ---------------------------------------------------------------------------
+# hosted v4 batch protocol: upload handshake, polling, archive unpacking
+# ---------------------------------------------------------------------------
+
+
+async def _no_sleep(_seconds):
+    """Poll without waiting, so the timeout test does not spend real seconds."""
+    return None
+
+
+def _zip_bytes(entries):
+    """Build an in-memory zip from {name: text-bytes}."""
+    import io as _io
+    import zipfile
+
+    buf = _io.BytesIO()
+    with zipfile.ZipFile(buf, "w") as zf:
+        for name, blob in entries.items():
+            zf.writestr(name, blob)
+    return buf.getvalue()
+
+
+class _FakeResponse:
+    def __init__(self, payload=None, content=b""):
+        self._payload = payload
+        self.content = content
+
+    def raise_for_status(self):
+        return None
+
+    def json(self):
+        return self._payload
+
+
+class _HostedClient:
+    """Replays the hosted v4 conversation: reserve url, PUT, poll, download."""
+
+    def __init__(self, polls, zip_url="https://oss.example/result.zip", zip_payload=b""):
+        self.polls = list(polls)
+        self.zip_url = zip_url
+        self.zip_payload = zip_payload
+        self.calls = []
+
+    async def post(self, url, **kw):
+        self.calls.append(("POST", url, kw))
+        return _FakeResponse(
+            {
+                "code": 0,
+                "data": {
+                    "batch_id": "batch-1",
+                    "file_urls": ["https://oss.example/upload/doc.pdf"],
+                },
+            }
+        )
+
+    async def put(self, url, **kw):
+        self.calls.append(("PUT", url, kw))
+        return _FakeResponse()
+
+    async def get(self, url, **kw):
+        self.calls.append(("GET", url, kw))
+        if "/extract-results/" in url:
+            if not self.polls:
+                raise AssertionError("polled more times than the test scripted")
+            return _FakeResponse(self.polls.pop(0))
+        return _FakeResponse(content=self.zip_payload)
+
+
+def _hosted_parser(timeout=30.0):
+    from openviking_cli.utils.config.parser_config import PDFConfig
+
+    return PDFParser(
+        PDFConfig(
+            strategy="mineru",
+            mineru_endpoint="https://mineru.example/api",
+            mineru_token="tok",
+            mineru_timeout=timeout,
+        )
+    )
+
+
+def test_hosted_batch_reserves_uploads_polls_and_unpacks(monkeypatch, pdf_path):
+    archive = _zip_bytes(
+        {
+            "full.md": b"# Title\n\n![fig](images/fig-1.png)",
+            "images/fig-1.png": b"\x89PNG-bytes",
+        }
+    )
+    client = _HostedClient(
+        polls=[
+            {"code": 0, "data": {"extract_result": [{"state": "waiting-file"}]}},
+            {
+                "code": 0,
+                "data": {
+                    "extract_result": [
+                        {"state": "done", "full_zip_url": "https://oss.example/result.zip"}
+                    ]
+                },
+            },
+        ],
+        zip_payload=archive,
+    )
+
+    saved = {}
+
+    class _Storage:
+        media_dir = Path("/media")
+
+        def save_image(self, resource_name, blob, filename, extension):
+            saved[(resource_name, filename, extension)] = blob
+            return Path("/media") / resource_name / (filename + extension)
+
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **kw: client)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    parser = _hosted_parser()
+    meta = {}
+    text, meta = asyncio.run(parser._mineru_hosted_batch(client, meta, pdf_path, _Storage(), "doc"))
+
+    assert text.startswith("# Title")
+    # the image reference must point at where the file was written
+    assert "images/fig-1.png" not in text
+    assert "doc/fig-1.png" in text
+    assert meta["api_version"] == "task-zip"
+    assert meta["images_saved"] == 1
+    assert meta["batch_id"] == "batch-1"
+    assert saved[("doc", "fig-1", ".png")] == b"\x89PNG-bytes"
+
+    verbs = [c[0] for c in client.calls]
+    assert verbs[0] == "POST" and "/file-urls/batch" in client.calls[0][1]
+    assert verbs[1] == "PUT"
+    # the pre-signed upload carries no Content-Type and no MinerU bearer
+    assert client.calls[1][2]["headers"] == {"Content-Type": ""}
+    # the archive download must not carry the token to the storage host
+    zip_get = [c for c in client.calls if c[0] == "GET" and "result.zip" in c[1]][0]
+    assert "headers" not in zip_get[2]
+
+
+def test_hosted_batch_times_out_without_a_result(monkeypatch, pdf_path):
+    client = _HostedClient(polls=[{"data": {"extract_result": [{"state": "running"}]}}] * 3)
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **kw: client)
+    monkeypatch.setattr(asyncio, "sleep", _no_sleep)
+
+    parser = _hosted_parser(timeout=5.0)
+    try:
+        asyncio.run(parser._mineru_hosted_batch(client, {}, pdf_path, None, "doc"))
+    except TimeoutError as e:
+        assert "did not finish" in str(e)
+    else:
+        raise AssertionError("expected TimeoutError")
+
+
+def test_hosted_batch_reports_a_failed_batch(monkeypatch, pdf_path):
+    client = _HostedClient(
+        polls=[{"data": {"extract_result": [{"state": "failed", "err_msg": "bad pdf"}]}}]
+    )
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **kw: client)
+
+    parser = _hosted_parser()
+    try:
+        asyncio.run(parser._mineru_hosted_batch(client, {}, pdf_path, None, "doc"))
+    except ValueError as e:
+        assert "err_msg=bad pdf" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_hosted_batch_done_without_zip_url_is_an_error(monkeypatch, pdf_path):
+    client = _HostedClient(polls=[{"data": {"extract_result": [{"state": "done"}]}}])
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **kw: client)
+
+    parser = _hosted_parser()
+    try:
+        asyncio.run(parser._mineru_hosted_batch(client, {}, pdf_path, None, "doc"))
+    except ValueError as e:
+        assert "without a result zip" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_submit_file_batch_rejects_a_reply_without_urls(monkeypatch, pdf_path):
+    class _NoUrls(_HostedClient):
+        async def post(self, url, **kw):
+            return _FakeResponse({"code": 0, "data": {"file_urls": []}})
+
+    parser = _hosted_parser()
+    try:
+        asyncio.run(
+            parser._mineru_submit_file_batch(_NoUrls([]), "https://mineru.example/api", pdf_path)
+        )
+    except ValueError as e:
+        assert "no file_urls" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_post_json_raises_on_a_business_error_code():
+    import httpx
+
+    from openviking_cli.utils.config.parser_config import PDFConfig
+
+    parser = PDFParser(PDFConfig(mineru_endpoint="https://x", mineru_token="t"))
+
+    class _Client:
+        async def post(self, *a, **kw):
+            return _FakeResponse({"code": 4001, "msg": "quota exceeded"})
+
+    try:
+        asyncio.run(parser._mineru_post_json(_Client(), "https://x/y", {}))
+    except RuntimeError as e:
+        assert "code=4001" in str(e) and "quota exceeded" in str(e)
+    else:
+        raise AssertionError("expected RuntimeError")
+    assert httpx is not None
+
+
+def test_pick_markdown_prefers_full_md(tmp_path):
+    (tmp_path / "full.md").write_text("full", encoding="utf-8")
+    (tmp_path / "other.md").write_text("other", encoding="utf-8")
+    nested = tmp_path / "deep" / "deeper"
+    nested.mkdir(parents=True)
+    (nested / "x.md").write_text("x", encoding="utf-8")
+
+    assert PDFParser._mineru_pick_markdown(tmp_path).name == "full.md"
+
+
+def test_pick_markdown_returns_the_only_candidate_and_none_for_empty(tmp_path):
+    assert PDFParser._mineru_pick_markdown(tmp_path) is None
+    only = tmp_path / "doc.md"
+    only.write_text("x", encoding="utf-8")
+    assert PDFParser._mineru_pick_markdown(tmp_path) == only
+
+
+def test_pick_markdown_falls_back_to_the_shallowest_largest(tmp_path):
+    deep = tmp_path / "a" / "b"
+    deep.mkdir(parents=True)
+    (deep / "big.md").write_text("x" * 50, encoding="utf-8")
+    (tmp_path / "small.md").write_text("y", encoding="utf-8")
+    assert PDFParser._mineru_pick_markdown(tmp_path).parent == tmp_path
+
+
+def test_unpack_zip_without_markdown_is_an_error(pdf_path):
+    parser = _hosted_parser()
+    try:
+        parser._mineru_unpack_zip(_zip_bytes({"images/a.png": b"x"}), pdf_path, {})
+    except ValueError as e:
+        assert "No markdown file found" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_unpack_zip_handles_empty_markdown(pdf_path):
+    parser = _hosted_parser()
+    text, meta = parser._mineru_unpack_zip(_zip_bytes({"full.md": b""}), pdf_path, {})
+    assert text == ""
+    assert meta["api_version"] == "task-zip"
+
+
+def test_online_state_helpers():
+    entry = lambda **kw: {"data": {"extract_result": [kw]}}  # noqa: E731
+    assert PDFParser._mineru_online_done(entry(state="done"))
+    assert not PDFParser._mineru_online_done(entry(state="running"))
+    assert not PDFParser._mineru_online_done({})
+    for busy in ("waiting", "waiting-file", "uploading", "pending", "running", "converting"):
+        assert PDFParser._mineru_online_busy(entry(state=busy)), busy
+    assert not PDFParser._mineru_online_busy(entry(state="done"))
+    assert PDFParser._mineru_online_result_entry({"extract_result": []}) is None
+    assert PDFParser._mineru_online_result_entry({"extract_result": [1]}) is None
+
+
+def test_online_zip_url_and_failure_detail():
+    good = {"extract_result": [{"full_zip_url": "https://a/b.zip"}]}
+    assert PDFParser._mineru_online_zip_url(good) == "https://a/b.zip"
+    assert PDFParser._mineru_online_zip_url({"extract_result": [{"zip_url": "ftp://x"}]}) is None
+    assert PDFParser._mineru_online_zip_url({}) is None
+    assert (
+        PDFParser._mineru_online_failure_detail({"extract_result": [{"err_no": "E9"}]})
+        == "err_no=E9"
+    )
+    # with nothing on the entry, the generic failure detail still yields text
+    assert PDFParser._mineru_online_failure_detail({"msg": "nope"})
+
+
+def test_extract_markdown_collects_only_image_files(tmp_path):
+    (tmp_path / "full.md").write_text("# t", encoding="utf-8")
+    (tmp_path / "images").mkdir()
+    (tmp_path / "images" / "a.png").write_bytes(b"p")
+    (tmp_path / "images" / "b.txt").write_bytes(b"t")
+
+    from openviking_cli.utils.config.parser_config import PDFConfig
+
+    parser = PDFParser(PDFConfig(mineru_endpoint="https://x"))
+    text, images = parser._mineru_extract_markdown(tmp_path / "full.md", tmp_path)
+    assert text == "# t"
+    assert list(images) == ["images/a.png"]
+
+
+def test_decode_inline_images_skips_bad_payloads():
+    decoded = PDFParser._mineru_decode_inline_images(
+        {"ok.png": "data:image/png;base64,ZmFrZQ==", "bad.png": "!!!not base64!!!"}
+    )
+    assert decoded == {"ok.png": b"fake"}
+    assert PDFParser._mineru_decode_inline_images(None) == {}
+
+
+def test_save_images_returns_empty_and_survives_a_failing_store():
+    from openviking_cli.utils.config.parser_config import PDFConfig
+
+    parser = PDFParser(PDFConfig(mineru_endpoint="https://x"))
+    assert asyncio.run(parser._mineru_save_images({}, None, None)) == {}
+
+    class _Broken:
+        media_dir = Path("/media")
+
+        def save_image(self, *a, **kw):
+            raise OSError("disk full")
+
+    assert asyncio.run(parser._mineru_save_images({"a.png": b"x"}, _Broken(), "doc")) == {}
+
+
+def test_convert_mineru_requires_an_endpoint():
+
+    parser = _hosted_parser()
+    parser.config.mineru_endpoint = ""
+    try:
+        asyncio.run(parser._convert_mineru(Path("x.pdf")))
+    except ValueError as e:
+        assert "endpoint not configured" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_payload_unwrapping_and_sync_entry_edges(tmp_path):
+    assert PDFParser._mineru_payload_data({"data": {"k": 1}}) == {"k": 1}
+    assert PDFParser._mineru_payload_data({"k": 1}) == {"k": 1}
+    assert PDFParser._mineru_payload_data(["not", "a", "dict"]) == ["not", "a", "dict"]
+    # a truthy non-dict results value must be rejected, not iterated
+    assert PDFParser._mineru_sync_entry({"results": "oops"}, tmp_path / "a.pdf") is None
+    assert PDFParser._mineru_sync_entry({"results": []}, tmp_path / "a.pdf") is None
+    assert PDFParser._mineru_sync_entry({"results": {"a.pdf": "s"}}, tmp_path / "a.pdf") is None
+    assert PDFParser._mineru_sync_entry(
+        {"results": {"b.pdf": {"md_content": "x"}}}, tmp_path / "a.pdf"
+    ) == {"md_content": "x"}
+
+
+def test_http_status_reads_the_status_off_an_exception():
+    import httpx
+
+    req = httpx.Request("GET", "https://x")
+    resp = httpx.Response(503, request=req)
+    exc = httpx.HTTPStatusError("boom", request=req, response=resp)
+    assert PDFParser._http_status(exc) == 503
+    assert PDFParser._http_status(ValueError("no response")) is None
+
+
+def test_failure_detail_falls_back_when_the_reply_says_nothing():
+    assert PDFParser._mineru_online_failure_detail({}) == "no failure detail reported"
+    # a reason on the batch envelope still surfaces when the entry is silent
+    assert PDFParser._mineru_online_failure_detail({"data": {"msg": "quota"}}) == "msg=quota"
+
+
+def test_unpack_zip_defaults_resource_name_and_skips_subdirectories(pdf_path):
+    archive = _zip_bytes(
+        {
+            "full.md": b"![a](images/a.png)",
+            "images/a.png": b"png",
+            "images/nested-dir/x": b"junk",
+        }
+    )
+    saved = {}
+
+    class _Storage:
+        media_dir = Path("/media")
+
+        def save_image(self, resource_name, blob, filename, extension):
+            saved["resource"] = resource_name
+            return Path("/media") / resource_name / (filename + extension)
+
+    parser = _hosted_parser()
+    # resource_name=None must fall back to the pdf stem
+    text, meta = parser._mineru_unpack_zip(archive, pdf_path, {}, _Storage(), None)
+    assert saved["resource"] == pdf_path.stem
+    assert meta["images_saved"] == 1
+    assert "images/a.png" not in text
+
+
+def test_unpack_zip_uses_the_default_storage_when_none_is_given(pdf_path, monkeypatch):
+    archive = _zip_bytes({"full.md": b"![a](images/a.png)", "images/a.png": b"png"})
+
+    class _Storage:
+        media_dir = Path("/media")
+
+        def save_image(self, resource_name, blob, filename, extension):
+            return Path("/media") / resource_name / (filename + extension)
+
+    monkeypatch.setattr(
+        "openviking_cli.utils.storage.get_storage", lambda: _Storage(), raising=False
+    )
+    parser = _hosted_parser()
+    text, meta = parser._mineru_unpack_zip(archive, pdf_path, {}, None, "doc")
+    assert meta["images_saved"] == 1
+    assert "doc/a.png" in text
+
+
+def test_selfhosted_without_markdown_is_an_error(pdf_path):
+    class _Client:
+        async def post(self, *a, **kw):
+            return _FakeResponse({"results": {}})
+
+    parser = _hosted_parser()
+    parser.config.mineru_token = ""
+    try:
+        asyncio.run(parser._mineru_selfhosted(_Client(), {}, pdf_path, None, "doc"))
+    except ValueError as e:
+        assert "returned no markdown" in str(e)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_save_images_falls_back_to_the_default_storage(monkeypatch):
+    class _Storage:
+        media_dir = Path("/media")
+
+        def save_image(self, resource_name, blob, filename, extension):
+            return Path("/media") / resource_name / (filename + extension)
+
+    monkeypatch.setattr(
+        "openviking_cli.utils.storage.get_storage", lambda: _Storage(), raising=False
+    )
+    parser = _hosted_parser()
+    repl = asyncio.run(parser._mineru_save_images({"images/a.png": b"png"}, None, "doc"))
+    assert repl == {"images/a.png": "doc/a.png"}
+
+
+def test_parse_records_the_effective_strategy(monkeypatch, pdf_path):
+    """`auto` records which converter ran, not only what was requested."""
+    from openviking.parse.base import NodeType, ResourceNode, create_parse_result
+
+    class _MD:
+        async def parse_content(self, content, **kw):
+            return create_parse_result(
+                root=ResourceNode(type=NodeType.ROOT),
+                source_path=kw.get("source_path", ""),
+                source_format="pdf",
+                parser_name="MarkdownParser",
+                parse_time=0.0,
+            )
+
+    class _Storage:
+        media_dir = Path("/media")
+
+    parser = _hosted_parser()
+    parser.config.strategy = "auto"
+
+    async def _remote(pdf, resource_name=None):
+        return "remote markdown", {"strategy": "mineru"}
+
+    monkeypatch.setattr(type(parser), "_remote_converters", lambda self: [("mineru", _remote)])
+    monkeypatch.setattr(type(parser), "_get_markdown_parser", lambda self: _MD())
+    monkeypatch.setattr(
+        "openviking_cli.utils.storage.get_storage", lambda: _Storage(), raising=False
+    )
+
+    result = asyncio.run(parser.parse(pdf_path))
+    assert result.meta["pdf_strategy"] == "auto"
+    assert result.meta["pdf_strategy_effective"] == "mineru"

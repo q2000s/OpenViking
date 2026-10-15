@@ -794,7 +794,13 @@ class PDFParser(BaseParser):
         for key in ("err_msg", "err_no", "state", "message", "msg"):
             if entry.get(key):
                 return f"{key}={entry[key]}"
-        return cls._mineru_failure_detail(body)
+        # The batch envelope can carry the reason even when the entry is silent.
+        data = cls._mineru_payload_data(body)
+        if isinstance(data, dict):
+            for key in ("err_msg", "err_no", "message", "msg"):
+                if data.get(key):
+                    return f"{key}={data[key]}"
+        return "no failure detail reported"
 
     @classmethod
     def _mineru_online_zip_url(cls, body: Dict[str, Any]) -> Optional[str]:
