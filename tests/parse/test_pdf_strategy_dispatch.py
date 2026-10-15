@@ -1113,7 +1113,8 @@ def test_selfhosted_success_status_still_returns_markdown(tmp_path):
     assert text == "# ok"
 
 
-def test_unknown_strategy_is_rejected(monkeypatch, pdf_path):
+def test_parser_rejects_a_strategy_it_cannot_dispatch(monkeypatch, pdf_path):
+    """The parser's own dispatch guard, past config validation."""
     monkeypatch.setattr(PDFConfig, "validate", lambda self: None)
     parser = _parser(strategy="nonsense")
     try:
