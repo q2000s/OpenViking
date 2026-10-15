@@ -1105,6 +1105,24 @@ visible after the fact.
 The startup preflight follows the same rule: `mineru` fails fast if the endpoint is not
 ready, `auto` only warns and leaves the retry to the first parse.
 
+### Remote circuit breaker
+
+A remote provider that fails `3` times in a row is circuit-broken. Every remaining
+document in that batch goes straight to the local parser instead of paying for a call
+that already failed the same way. After a `20` second cooldown exactly one document is
+let through as a probe: a recovered service is picked up again, and a service that is
+still down costs a single call rather than the whole batch. A failing probe re-arms the
+cooldown rather than retrying on every document.
+
+Documents that fell back are counted in `pdf_remote_degraded` on the parse result, so a
+batch that quietly stopped reaching the remote parser is visible after the fact.
+
+```
+class PDFParser:
+    _remote_circuit_threshold = 3      # consecutive failures that open the circuit
+    _remote_circuit_cooldown = 20.0    # seconds before one probe is let through
+```
+
 :::warning Behavior change
 `auto` previously tried the local parser **first** and only used MinerU when local
 parsing failed. It now prefers the configured remote parser. If you have `mineru_endpoint`
