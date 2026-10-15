@@ -88,6 +88,7 @@ class Upstream(BaseModel):
     name: str
     protocol: ProtocolName
     base_url: str
+    append_endpoint_path: bool = True
     api_key: str = ""
     auth_mode: Literal["managed", "passthrough"] = "managed"
     headers: dict[str, str] = Field(default_factory=dict)
@@ -129,6 +130,18 @@ class Upstream(BaseModel):
             )
         return value.rstrip("/")
 
+    @model_validator(mode="after")
+    def validate_protocol_base(self):
+        if (
+            self.append_endpoint_path
+            and self.protocol == "anthropic"
+            and urlsplit(self.base_url).path.endswith("/v1")
+        ):
+            raise ValueError(
+                "Anthropic base_url must not end in /v1; the gateway appends /v1/messages"
+            )
+        return self
+
     @field_validator("headers")
     @classmethod
     def validate_headers(cls, value: dict[str, str]) -> dict[str, str]:
@@ -142,10 +155,16 @@ class Upstream(BaseModel):
         return value
 
 
+class UpstreamTestRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid", str_strip_whitespace=True)
+    model: str | None = Field(default=None, min_length=1, max_length=256)
+
+
 class KeyRequest(BaseModel):
     model_config = ConfigDict(extra="forbid")
     name: str
-    openviking_key: str
+    openviking_key: str = ""
+    user_id: str | None = None
     policy_id: str
     upstream_ids: list[str] = Field(min_length=1)
     models: list[str] = Field(default_factory=list)

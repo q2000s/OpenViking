@@ -11,6 +11,15 @@ OpenViking 的所有重要变更都将记录在此文件中。
 - **MinerU 托管服务支持（`mineru_token`）**：新增 `pdf.mineru_token` 用于携带托管版 MinerU 服务的 Bearer token；由于该服务没有 `/file_parse` 路由，配置它同时会选中托管批处理协议：`POST /file-urls/batch` 预留上传 URL → `PUT` 上传 PDF → 轮询 `GET /extract-results/batch/{batch_id}` → 下载 `full_zip_url` 并取出 markdown 与其图片。未配置 token 时仍使用原有的自托管 `/file_parse` 协议，现有部署不受影响。若批处理握手被拒，解析器会再尝试一次 `/file_parse`，以保持带 token 的自托管部署仍然可用。
 - **PDF `auto` 策略改为优先使用已配置的远程解析器（行为变更）**：`auto` 现在会将每份 PDF 发往已配置的远程解析服务，本地解析器仅作兜底；而之前是先本地、本地失败才使用 MinerU。若配置了 `pdf.mineru_endpoint`，请预期延迟、额度消耗与限流风险发生变化；在限流情况下，回退机制会让导入变慢而不是变快。若希望保持原有行为请设为 `strategy: local`；若希望远程解析必须成功、失败即失败，请设为 `strategy: mineru`。远程失败会仅降级单份文档而不使整批导入失败，并由 `pdf_strategy_effective`（`mineru` 或 `local`）记录实际使用的转换器。服务类配置（`mineru_endpoint`、`mineru_token`、`mineru_bodys`）保持当前位置，未来接入新的远程解析服务时只需增加 provider，而无需新增 `strategy` 取值。
 
+- **LangChain 导入迁移（不兼容变更）**：服务端不再提供
+  `openviking.integrations.langchain` 及其转发模块，旧导入会立即失败，
+  不提供弃用过渡期或兼容占位模块。请安装 `langchain-openviking`
+  （LangGraph 使用 `pip install "langchain-openviking[langgraph]"`），
+  将导入前缀 `openviking.integrations.langchain` 改为 `langchain_openviking`，
+  子模块导入也需同步修改。例如使用
+  `from langchain_openviking import OpenVikingRetriever`。维护中的包和示例迁至
+  `integrations/frameworks/`，包名和标准导入路径保持不变。
+  详见[迁移指南](../agent-integrations/07-langchain-langgraph.md)。
 - **Working Memory 默认关闭（行为变更）**：commit 仍保存原文并抽取长期记忆，默认不生成
   WM 或 checkpoint 摘要。用户需要单独升级已安装的 agent 插件；新版默认关闭自动归档
   摘要注入和上下文接管，由宿主管理历史与压缩。VikingBot 仍默认使用 OV 管理上下文与压缩，

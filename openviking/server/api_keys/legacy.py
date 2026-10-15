@@ -15,6 +15,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError
 from typing_extensions import deprecated
 
+from openviking.core.identifiers import validate_identifier_length
 from openviking.pyagfs import AGFSAlreadyExistsError, AGFSNotFoundError, AsyncAGFSClient
 from openviking.pyagfs.async_client import fs_ctx_from_agfs_path
 from openviking.server.account_stores.base import AccountStore
@@ -51,6 +52,7 @@ logger = get_logger(__name__)
 ACCOUNTS_PATH = "/local/_system/accounts.json"
 USERS_PATH_TEMPLATE = "/local/{account_id}/_system/users.json"
 GROUPS_PATH_TEMPLATE = "/local/{account_id}/_system/groups.json"
+_MAX_FILE_ACCOUNT_ID_BYTES = 255
 
 
 # Argon2id parameters - export with LEGACY_ prefix for reuse in new.py
@@ -70,6 +72,14 @@ def derive_seeded_api_key_secret(user_id: str, seed: str) -> str:
     if not isinstance(seed, str) or seed == "":
         raise InvalidArgumentError("seed must not be empty")
     return hashlib.sha256(f"{user_id}\0{seed}".encode("utf-8")).hexdigest()
+
+
+def validate_file_account_id(account_id: str) -> None:
+    """Reject new account IDs that cannot be used as file path components."""
+    if len(account_id.encode("utf-8")) > _MAX_FILE_ACCOUNT_ID_BYTES:
+        raise InvalidArgumentError(
+            f"account_id must not exceed {_MAX_FILE_ACCOUNT_ID_BYTES} UTF-8 bytes."
+        )
 
 
 def _paginate(items: list, limit: int | None, page: int) -> list:
@@ -455,7 +465,11 @@ class FileStore(AccountStore):
         """Create an account and its first admin, optionally with a credential."""
         if error := validate_account_id(account_id):
             raise InvalidArgumentError(error)
+        # Only new accounts: existing remote-backed identities remain readable.
+        validate_file_account_id(account_id)
         if error := validate_user_id(admin_user_id):
+            raise InvalidArgumentError(error)
+        if error := validate_identifier_length(admin_user_id, "admin_user_id"):
             raise InvalidArgumentError(error)
         if account_id in self._accounts:
             raise AlreadyExistsError(account_id, "account")
@@ -513,6 +527,8 @@ class FileStore(AccountStore):
         """Create a user, optionally including its initial API key."""
         resolved_role = validate_account_user_role(role)
         if error := validate_user_id(user_id):
+            raise InvalidArgumentError(error)
+        if error := validate_identifier_length(user_id, "user_id"):
             raise InvalidArgumentError(error)
         self._ensure_account_active(account_id)
         account = self._accounts.get(account_id)
@@ -633,6 +649,11 @@ class FileStore(AccountStore):
                 error = validate_user_id(user_id)
                 if error:
                     raise InvalidArgumentError(error)
+                account = self._accounts.get(account_id)
+                if account is None or user_id not in account.users:
+                    error = validate_identifier_length(user_id, "user_id")
+                    if error:
+                        raise InvalidArgumentError(error)
 
         created_accounts = 0
         created_users = 0
@@ -658,6 +679,7 @@ class FileStore(AccountStore):
             }
             for account_id in normalized:
                 if account_id not in persisted_accounts:
+                    validate_file_account_id(account_id)
                     persisted_accounts[account_id] = {"created_at": now}
                     created_accounts += 1
             if created_accounts:

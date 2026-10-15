@@ -2,8 +2,6 @@
 # SPDX-License-Identifier: AGPL-3.0
 """System endpoints for OpenViking HTTP Server."""
 
-from typing import Optional
-
 from fastapi import APIRouter, Depends, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -38,18 +36,12 @@ def _is_ready_check_ok(value) -> bool:
 
 
 async def _probe_agfs_readiness() -> dict[str, object]:
-    """Return structured AGFS readiness, including multi-write sync health when available."""
+    """Return structured AGFS filesystem readiness."""
     viking_fs = get_viking_fs()
     checks: dict[str, object] = {}
 
     await viking_fs.ls("viking://", ctx=None)
     checks["filesystem"] = "ok"
-
-    try:
-        await viking_fs.system_sync_status("viking://", ctx=None)
-        checks["multiwrite_sync"] = "ok"
-    except (AGFSInvalidOperationError, AGFSNotSupportedError):
-        checks["multiwrite_sync"] = "not_supported"
 
     return {"status": "ok", "checks": checks}
 
@@ -126,7 +118,7 @@ async def readiness_check(request: Request):
 
     checks = {}
 
-    # 1. AGFS: probe filesystem access and multi-write sync health
+    # 1. AGFS: probe filesystem access
     try:
         checks["agfs"] = await _probe_agfs_readiness()
     except Exception as e:
@@ -208,32 +200,19 @@ async def system_status(
     )
 
 
-class WaitRequest(BaseModel):
-    """Request model for wait."""
-
-    timeout: Optional[float] = None
-
-
 class ConsistencyRequest(BaseModel):
     """Request model for filesystem/vector-index consistency checks."""
 
     uri: str
 
 
-class BackendSyncRequest(BaseModel):
-    """Request model for backend sync status and retry operations."""
-
-    uri: str
-
-
 @router.post("/api/v1/system/wait", tags=["system"])
 async def wait_processed(
-    request: WaitRequest,
     _ctx: RequestContext = Depends(get_request_context),
 ):
     """Wait for all processing to complete."""
     service = get_service()
-    result = await service.resources.wait_processed(timeout=request.timeout)
+    result = await service.resources.wait_processed()
     return Response(status="ok", result=result)
 
 
@@ -249,52 +228,4 @@ async def check_consistency(
         uri=uri,
         ctx=ctx,
     )
-    return Response(status="ok", result=result)
-
-
-@router.post("/api/v1/system/backend/sync-status", tags=["system"])
-async def backend_sync_status(
-    request: BackendSyncRequest,
-    ctx: RequestContext = require_role(Role.ROOT, Role.ADMIN),
-):
-    """Return multi-write backend sync status for a Viking URI subtree."""
-    service = get_service()
-    uri = validate_request_viking_uri(resolve_path_variables(request.uri), ctx)
-    result = await service.fs.system_sync_status(uri, ctx=ctx)
-    return Response(status="ok", result=result)
-
-
-@router.post("/api/v1/system/backend/sync-retry", tags=["system"])
-async def backend_sync_retry(
-    request: BackendSyncRequest,
-    ctx: RequestContext = require_role(Role.ROOT, Role.ADMIN),
-):
-    """Retry pending multi-write backend sync work for a Viking URI subtree."""
-    service = get_service()
-    uri = validate_request_viking_uri(resolve_path_variables(request.uri), ctx)
-    result = await service.fs.system_sync_retry(uri, ctx=ctx)
-    return Response(status="ok", result=result)
-
-
-@router.get("/api/v1/system/sync/{sync_path:path}", tags=["system"])
-async def admin_sync_status(
-    sync_path: str,
-    ctx: RequestContext = require_role(Role.ROOT, Role.ADMIN),
-):
-    """Return multi-write backend sync status for one URI subtree through the admin API."""
-    service = get_service()
-    uri = validate_request_viking_uri(resolve_path_variables(sync_path), ctx)
-    result = await service.fs.system_sync_status(uri, ctx=ctx)
-    return Response(status="ok", result=result)
-
-
-@router.post("/api/v1/system/sync/{sync_path:path}/retry", tags=["system"])
-async def admin_sync_retry(
-    sync_path: str,
-    ctx: RequestContext = require_role(Role.ROOT, Role.ADMIN),
-):
-    """Retry pending multi-write backend sync work for one URI subtree through the admin API."""
-    service = get_service()
-    uri = validate_request_viking_uri(resolve_path_variables(sync_path), ctx)
-    result = await service.fs.system_sync_retry(uri, ctx=ctx)
     return Response(status="ok", result=result)
