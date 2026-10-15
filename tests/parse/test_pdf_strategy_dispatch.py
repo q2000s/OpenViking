@@ -855,8 +855,7 @@ def test_selfhosted_without_markdown_is_an_error(pdf_path):
         async def post(self, *a, **kw):
             return _FakeResponse({"results": {}})
 
-    parser = _hosted_parser()
-    parser.config.mineru_token = ""
+    parser = _parser(strategy="mineru", mineru_endpoint="https://mineru.example")
     try:
         asyncio.run(parser._mineru_selfhosted(_Client(), {}, pdf_path, None, "doc"))
     except ValueError as e:
@@ -912,3 +911,293 @@ def test_parse_records_the_effective_strategy(monkeypatch, pdf_path):
     result = asyncio.run(parser.parse(pdf_path))
     assert result.meta["pdf_strategy"] == "auto"
     assert result.meta["pdf_strategy_effective"] == "mineru"
+
+
+# ---------------------------------------------------------------------------
+# review round 3: hosted preflight, self-hosted image keys, failure status
+# ---------------------------------------------------------------------------
+
+
+def test_hosted_preflight_accepts_the_missing_health_route():
+    """The hosted API has no /health; a 404 there must not fail startup.
+
+    Probing it with the self-hosted contract would reject a service that is up and
+    correctly configured, which is what blocked strategy="mineru" at boot.
+    """
+    import openviking.service.mineru_preflight as pf
+
+    seen = {}
+
+    class _Resp:
+        status_code = 404
+
+        def json(self):
+            return {}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            seen["url"] = url
+            seen["headers"] = kw.get("headers")
+            return _Resp()
+
+    pf.httpx.AsyncClient = lambda **kw: _Client()
+    asyncio.run(
+        pf.wait_for_mineru_ready(
+            "https://mineru.example/api/v4", timeout=1, hosted=True, token="tok"
+        )
+    )
+    # a real route was probed, not /health
+    assert "/health" not in seen["url"]
+    assert seen["headers"] == {"Authorization": "Bearer tok"}
+
+
+def test_hosted_preflight_still_rejects_a_rejected_token():
+    import openviking.service.mineru_preflight as pf
+
+    class _Resp:
+        status_code = 401
+
+        def json(self):
+            return {}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+    pf.httpx.AsyncClient = lambda **kw: _Client()
+    try:
+        asyncio.run(
+            pf.wait_for_mineru_ready(
+                "https://mineru.example/api/v4", timeout=0.2, hosted=True, token="bad"
+            )
+        )
+    except RuntimeError as exc:
+        assert "401" in str(exc)
+    else:
+        raise AssertionError("a rejected token must fail the preflight")
+
+
+def test_selfhosted_preflight_still_demands_the_health_contract():
+    import openviking.service.mineru_preflight as pf
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return {"protocol_version": "1.0", "status": "healthy"}
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+    pf.httpx.AsyncClient = lambda **kw: _Client()
+    asyncio.run(pf.wait_for_mineru_ready("http://127.0.0.1:8000", timeout=1))
+
+
+def test_save_images_falls_back_to_the_image_stem_without_a_resource_name():
+    """resource_name=None must not hand None to the storage layer."""
+    parser = _parser(mineru_endpoint="https://x")
+
+    class _Storage:
+        media_dir = Path("/media")
+
+        def save_image(self, resource_name, blob, filename, extension):
+            # a real StoragePath rejects None here
+            assert resource_name, "resource_name must not be None"
+            return Path("/media") / resource_name / (filename + extension)
+
+    repl = asyncio.run(parser._mineru_save_images({"images/figure.png": b"png"}, _Storage(), None))
+    assert repl == {"images/figure.png": "figure/figure.png"}
+
+
+def test_image_refs_match_a_bare_key_against_a_prefixed_reference():
+    """A bare key with an ``images/`` reference must not become images/doc/images/."""
+    out = PDFParser._mineru_apply_image_refs(
+        "see ![f](images/figure.png)", {"figure.png": "doc/figure.png"}
+    )
+    assert out == "see ![f](doc/figure.png)"
+    assert "images/doc" not in out
+
+
+def test_image_refs_match_a_prefixed_key_against_a_bare_reference():
+    out = PDFParser._mineru_apply_image_refs(
+        "see ![f](figure.png)", {"images/figure.png": "doc/figure.png"}
+    )
+    assert out == "see ![f](doc/figure.png)"
+
+
+def test_image_refs_leave_similar_names_alone():
+    out = PDFParser._mineru_apply_image_refs(
+        "myfigure.png figure.pngx figure.png", {"figure.png": "doc/figure.png"}
+    )
+    assert out.startswith("myfigure.png figure.pngx ")
+    assert out.endswith("doc/figure.png")
+
+
+def test_selfhosted_failure_status_raises_even_with_partial_markdown(tmp_path):
+    """status="failed" plus partial md_content must not be returned as success."""
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    parser = _parser(strategy="mineru", mineru_endpoint="https://mineru.example")
+
+    payload = {
+        "results": {
+            "doc.pdf": {
+                "status": "failed",
+                "md_content": "half a doc",
+            }
+        }
+    }
+
+    class _Client:
+        async def post(self, *a, **kw):
+            return _FakeResponse(payload)
+
+    try:
+        asyncio.run(parser._mineru_selfhosted(_Client(), {}, pdf, None, "doc"))
+    except ValueError as exc:
+        assert "failed to convert" in str(exc)
+    else:
+        raise AssertionError("expected ValueError for a failed entry")
+
+
+def test_selfhosted_error_field_raises_even_when_markdown_is_present(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    parser = _parser(strategy="mineru", mineru_endpoint="https://mineru.example")
+
+    payload = {"results": {"doc.pdf": {"md_content": "half a doc", "err_msg": "corrupt page tree"}}}
+
+    class _Client:
+        async def post(self, *a, **kw):
+            return _FakeResponse(payload)
+
+    try:
+        asyncio.run(parser._mineru_selfhosted(_Client(), {}, pdf, None, "doc"))
+    except ValueError as exc:
+        assert "corrupt page tree" in str(exc)
+    else:
+        raise AssertionError("expected ValueError when err_msg is set")
+
+
+def test_selfhosted_success_status_still_returns_markdown(tmp_path):
+    pdf = tmp_path / "doc.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+    parser = _parser(strategy="mineru", mineru_endpoint="https://mineru.example")
+
+    payload = {"results": {"doc.pdf": {"status": "done", "md_content": "# ok"}}}
+
+    class _Client:
+        async def post(self, *a, **kw):
+            return _FakeResponse(payload)
+
+    text, _meta = asyncio.run(parser._mineru_selfhosted(_Client(), {}, pdf, None, "doc"))
+    assert text == "# ok"
+
+
+def test_unknown_strategy_is_rejected(monkeypatch, pdf_path):
+    monkeypatch.setattr(PDFConfig, "validate", lambda self: None)
+    parser = _parser(strategy="nonsense")
+    try:
+        asyncio.run(parser._convert_to_markdown(pdf_path))
+    except ValueError as exc:
+        assert "Unknown strategy" in str(exc)
+    else:
+        raise AssertionError("expected ValueError")
+
+
+def test_failure_message_falls_back_when_no_reason_is_reported(tmp_path):
+    """A failed entry with nothing to say still has to name the document."""
+    entry = {"status": "failed"}
+    msg = PDFParser._mineru_failure_message(entry, tmp_path / "report.pdf")
+    assert "report.pdf" in msg
+    assert "status=failed" in msg
+
+
+def test_entry_failure_detects_the_documented_states():
+    for state in ("failed", "FAILED", " error ", "aborted", "cancelled", "timeout"):
+        assert PDFParser._mineru_entry_failed({"status": state}), state
+    assert PDFParser._mineru_entry_failed({"state": "rejected"})
+    assert PDFParser._mineru_entry_failed({"err_no": "E42"})
+    # a completed or silent entry is not a failure
+    for ok in ({"status": "done"}, {"status": "success"}, {}, {"md_content": "x"}):
+        assert not PDFParser._mineru_entry_failed(ok), ok
+
+
+def test_local_image_rasteriser_returns_png_bytes():
+    """The local path renders an image box to real PNG bytes."""
+    parser = _parser(strategy="local")
+    saved = {}
+
+    class _Img:
+        def save(self, buffer, format):
+            saved["format"] = format
+            buffer.write(b"\x89PNG")
+
+    class _Crop:
+        def to_image(self, resolution=None):
+            saved["resolution"] = resolution
+            return _Img()
+
+    class _Page:
+        width = 100
+        height = 200
+
+        def crop(self, bbox):
+            saved["bbox"] = bbox
+            return _Crop()
+
+    out = parser._extract_image_from_page(_Page(), {"x0": 5, "top": 10, "x1": 50, "bottom": 60})
+    assert out == b"\x89PNG"
+    assert saved["format"] == "PNG"
+    assert saved["bbox"] == (5, 10, 50, 60)
+
+
+def test_local_image_rasteriser_swallows_a_render_failure():
+    """A broken image box costs that image, not the document."""
+    parser = _parser(strategy="local")
+
+    class _Page:
+        width = 100
+        height = 200
+
+        def crop(self, bbox):
+            raise RuntimeError("cannot rasterise")
+
+    assert (
+        parser._extract_image_from_page(_Page(), {"x0": 0, "top": 0, "x1": 9, "bottom": 9}) is None
+    )
+
+
+def test_local_image_rasteriser_skips_a_degenerate_box():
+    parser = _parser(strategy="local")
+
+    class _Page:
+        width = 100
+        height = 200
+
+        def crop(self, bbox):
+            raise AssertionError("a zero-area box must not be cropped")
+
+    assert (
+        parser._extract_image_from_page(_Page(), {"x0": 10, "top": 10, "x1": 10, "bottom": 40})
+        is None
+    )

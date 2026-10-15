@@ -37,6 +37,12 @@ from openviking_cli.utils.config.parser_config import PDFConfig
 
 logger = get_logger(__name__)
 
+# Per-file states a self-hosted ``/file_parse`` reply uses to report that the
+# conversion did not complete.
+_MINERU_FAILED_STATES = frozenset(
+    {"failed", "failure", "error", "aborted", "cancelled", "canceled", "timeout", "rejected"}
+)
+
 # PDFium is not thread-safe, even when rendering different documents.
 _PDFIUM_LOCK = threading.Lock()
 
@@ -938,13 +944,60 @@ class PDFParser(BaseParser):
         return result
 
     @staticmethod
+    def _mineru_entry_failed(entry: Dict[str, Any]) -> bool:
+        """Whether a per-file entry reports that the conversion did not complete.
+
+        A failed conversion can still carry a partial ``md_content``. Returning that
+        as a success hands back a silently truncated document: strict mode would not
+        raise and ``auto`` would never fall back to the local parser.
+        """
+        status = entry.get("status") or entry.get("state")
+        if isinstance(status, str) and status.strip().lower() in _MINERU_FAILED_STATES:
+            return True
+        return any(entry.get(key) for key in ("err_msg", "err_no", "error"))
+
+    @staticmethod
+    def _mineru_failure_message(entry: Dict[str, Any], pdf_path: Path) -> str:
+        """A readable reason for a failed per-file entry."""
+        for key in ("err_msg", "err_no", "error", "message", "msg", "status", "state"):
+            value = entry.get(key)
+            if value:
+                return f"MinerU failed to convert {pdf_path.name}: {key}={value}"
+        return f"MinerU failed to convert {pdf_path.name}"
+
+    @staticmethod
     def _mineru_sync_entry(payload: Dict[str, Any], pdf_path: Path) -> Optional[Dict[str, Any]]:
         """Pull this PDF's entry out of a ``/file_parse`` response."""
         results = payload.get("results") or {}
         if not isinstance(results, dict):
             return None
         entry = results.get(pdf_path.name) or next(iter(results.values()), None)
-        return entry if isinstance(entry, dict) else None
+        if not isinstance(entry, dict):
+            return None
+        if PDFParser._mineru_entry_failed(entry):
+            raise ValueError(PDFParser._mineru_failure_message(entry, pdf_path))
+        return entry
+
+    @staticmethod
+    def _mineru_apply_image_refs(text: str, repl: Dict[str, str]) -> str:
+        """Point markdown references at the images that were actually saved.
+
+        The provider's image key and the reference written in the body can disagree
+        about the directory: a key may be a bare ``figure.png`` while the body writes
+        ``images/figure.png``. Substituting the key literally would then yield
+        ``images/doc/figure.png`` and leave a broken link, so match the file name in
+        whatever directory position it appears and replace the whole reference.
+        """
+        for key in sorted(repl, key=len, reverse=True):
+            stored = repl[key]
+            name = key.replace("\\", "/").rsplit("/", 1)[-1]
+            if not name:
+                continue
+            # Only whole directory segments may precede the name: a bare prefix
+            # would swallow "my" in "myfigure.png" and rewrite the wrong file.
+            pattern = re.compile(r"(?<![\w/.-])(?:[\w.-]+/)*" + re.escape(name) + r"(?![\w.-])")
+            text = pattern.sub(lambda _m, s=stored: s, text)
+        return text
 
     def _mineru_extract_markdown(self, markdown: Path, root: Path) -> tuple[str, Dict[str, bytes]]:
         """Read markdown from an unpacked archive and collect its images."""
@@ -998,8 +1051,11 @@ class PDFParser(BaseParser):
         for name, blob in images.items():
             try:
                 img_path = Path(name)
+                # The storage layer needs a real directory name; handing it None
+                # loses the image to a swallowed error.
+                target = resource_name or img_path.stem
                 stored = storage.save_image(
-                    resource_name,
+                    target,
                     blob,
                     filename=img_path.stem,
                     extension=img_path.suffix or ".png",
@@ -1149,8 +1205,7 @@ class PDFParser(BaseParser):
         images = self._mineru_decode_inline_images(entry.get("images") or {})
         repl = await self._mineru_save_images(images, storage, resource_name)
         meta["images_saved"] = len(repl)
-        for original, stored in repl.items():
-            text = text.replace(original, stored)
+        text = self._mineru_apply_image_refs(text, repl)
         logger.info(f"MinerU conversion: {len(text)} chars, {len(repl)} images")
         return text, meta
 

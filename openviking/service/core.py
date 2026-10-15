@@ -691,8 +691,16 @@ class OpenVikingService:
         )
 
         if should_preflight_mineru and pdf_config.mineru_endpoint:
+            # A token marks the hosted API, which has no /health route. Probing it
+            # with the self-hosted contract would fail startup for a service that is
+            # reachable and correctly configured.
+            hosted = bool(pdf_config.mineru_token)
             try:
-                await wait_for_mineru_ready(pdf_config.mineru_endpoint)
+                await wait_for_mineru_ready(
+                    pdf_config.mineru_endpoint,
+                    hosted=hosted,
+                    token=pdf_config.mineru_token,
+                )
                 logger.info("MinerU preflight passed: %s", pdf_config.mineru_endpoint)
             except RuntimeError as exc:
                 if pdf_config.strategy == "mineru":
