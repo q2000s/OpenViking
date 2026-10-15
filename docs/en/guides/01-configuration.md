@@ -1090,16 +1090,12 @@ provider list rather than any single service, so adding a provider does not mean
 revisiting `auto`, the preflight, or this page. `mineru_enabled` remains the MinerU
 provider's own check.
 
-To keep a degraded batch cheap, `auto` does not retry blindly:
-
-- `429` and `5xx` are retried once after a short backoff, since they usually clear.
-- `404` and other permanent errors go straight to local; retrying cannot help.
-- After several consecutive failures the provider is circuit-broken: the rest of the
-  batch skips it instead of paying for a doomed call per document. The circuit
-  half-opens after a cooldown, so a recovered service is picked up again.
-- Documents that fell back are counted in `pdf_remote_degraded`, alongside
-  `pdf_strategy_effective`, so a batch that quietly stopped using the remote parser is
-  visible after the fact.
+`auto` tries each configured remote provider in turn and uses the first one that
+succeeds. A provider that raises is logged and the next option is tried, so any
+remote failure -- `404`, `405`, `429`, a timeout, a `5xx` -- degrades that document
+to local rather than failing it. The path actually taken is recorded in
+`pdf_strategy_effective`, so a batch that quietly stopped using the remote parser is
+visible after the fact.
 
 The startup preflight follows the same rule: `mineru` fails fast if the endpoint is not
 ready, `auto` only warns and leaves the retry to the first parse.

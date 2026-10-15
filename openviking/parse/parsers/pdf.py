@@ -22,7 +22,7 @@ import threading
 import time
 from collections import Counter, defaultdict
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Set, Tuple, Union
+from typing import Any, Dict, List, Optional, Tuple, Union
 
 from openviking.parse.base import (
     NodeType,
@@ -78,17 +78,6 @@ class PDFParser(BaseParser):
         """
         self.config = config or PDFConfig()
         self.config.validate()
-
-        # Remote-parse health, shared across documents parsed by this instance so a
-        # batch that hits a rate limit stops paying for doomed calls.
-        self._remote_failures: Dict[str, int] = {}
-        self._remote_circuit_open: Set[str] = set()
-        self._remote_skip_count: Dict[str, int] = {}
-        self._remote_circuit_cooldown = 20
-        self._remote_circuit_threshold = 3
-        self._remote_retry_on_transient = True
-        self._remote_retry_delay_seconds = 2.0
-        self._degraded = 0
 
         # Lazy import MarkdownParser to avoid circular imports
         self._markdown_parser = None
@@ -173,10 +162,6 @@ class PDFParser(BaseParser):
             effective = conversion_meta.get("strategy")
             if effective:
                 result.meta["pdf_strategy_effective"] = effective
-            if self._degraded:
-                # Count documents that had to fall back, so a batch that silently
-                # stopped using the remote parser is visible after the fact.
-                result.meta["pdf_remote_degraded"] = self._degraded
             result.meta["intermediate_markdown_length"] = len(markdown_content)
             result.meta["intermediate_markdown_preview"] = markdown_content[:500]
 
@@ -229,69 +214,16 @@ class PDFParser(BaseParser):
             # and the local parser is always the last resort. Adding a new external
             # parser should mean adding a provider entry, not a new strategy value.
             for name, convert in self._remote_converters():
-                if name in self._remote_circuit_open:
-                    # Stay off the remote for a while, then let one document through
-                    # as a probe: a service that recovers should be used again, and
-                    # one that is still down costs a single call, not the batch.
-                    self._remote_skip_count[name] = self._remote_skip_count.get(name, 0) + 1
-                    if self._remote_skip_count[name] < self._remote_circuit_cooldown:
-                        self._degraded += 1
-                        logger.debug(
-                            f"{name} still circuit-open "
-                            f"({self._remote_skip_count[name]}/{self._remote_circuit_cooldown})"
-                        )
-                        continue
-                    logger.info(f"{name} half-open, probing with this document")
                 try:
-                    result = await self._convert_remote_with_retry(
-                        name, convert, pdf_path, resource_name=resource_name
-                    )
+                    return await convert(pdf_path, resource_name=resource_name)
                 except Exception as e:
-                    self._remote_failures[name] = self._remote_failures.get(name, 0) + 1
-                    if self._remote_failures[name] >= self._remote_circuit_threshold:
-                        self._remote_circuit_open.add(name)
-                        logger.warning(
-                            f"{name} failed {self._remote_failures[name]} times in a row "
-                            f"({e}); routing the rest of this batch to local"
-                        )
-                    self._degraded += 1
-                    logger.warning(f"{name} conversion failed, trying the next option: {e}")
-                    continue
-                self._remote_failures.pop(name, None)
-                self._remote_skip_count.pop(name, None)
-                self._remote_circuit_open.discard(name)
-                return result
+                    # A remote failure degrades this one document to local rather
+                    # than failing the import.
+                    logger.warning(f"{name} conversion failed, using local: {e}")
             return await self._convert_local(pdf_path, resource_name=resource_name)
 
         else:
             raise ValueError(f"Unknown strategy: {self.config.strategy}")
-
-    async def _convert_remote_with_retry(
-        self,
-        name: str,
-        convert,
-        pdf_path: Path,
-        resource_name: Optional[str] = None,
-    ):
-        """Call a remote converter, retrying the failures that are worth retrying.
-
-        A 429 or a transient 5xx usually clears on its own, so one backed-off retry
-        is cheaper than degrading the document to local. A 404 or a bad request will
-        not clear, so it goes straight through and the circuit breaker takes over.
-        """
-        attempts = 2 if self._remote_retry_on_transient else 1
-        for attempt in range(attempts):
-            try:
-                return await convert(pdf_path, resource_name=resource_name)
-            except Exception as e:
-                if attempt + 1 >= attempts or not self._is_transient_remote_error(e):
-                    raise
-                delay = self._remote_retry_delay_seconds
-                logger.info(
-                    f"{name} transient failure (HTTP {PDFParser._http_status(e)}); retrying in {delay}s"
-                )
-                await asyncio.sleep(delay)
-        raise RuntimeError(f"{name} exhausted retries")  # pragma: no cover
 
     def _remote_converters(self) -> List[Tuple[str, Any]]:
         """External converters this config enables, in the order they should be tried.
@@ -784,19 +716,6 @@ class PDFParser(BaseParser):
     def _mineru_base_url(self) -> str:
         return self.config.mineru_endpoint.rstrip("/")
 
-    @staticmethod
-    def _is_transient_remote_error(exc: Exception) -> bool:
-        """Whether retrying could plausibly succeed.
-
-        Rate limiting and server-side faults are transient; a missing route or a
-        malformed request fails the same way every time, so retrying it would only
-        burn quota and latency.
-        """
-        status = PDFParser._http_status(exc)
-        if status is None:
-            return False
-        return status == 429 or 500 <= status < 600
-
     def _http_status(exc: Exception) -> Optional[int]:
         response = getattr(exc, "response", None)
         return getattr(response, "status_code", None)
@@ -887,10 +806,14 @@ class PDFParser(BaseParser):
         return None
 
     async def _mineru_download_zip(self, client, zip_url: str) -> bytes:
-        """Download the result archive (signed urls may already carry auth)."""
+        """Download the result archive.
+
+        The url is pre-signed by the storage backend and points at a different host,
+        so the MinerU bearer token must not be attached: it would leak the credential
+        to that host, and the signature does not need it.
+        """
         response = await client.get(
             zip_url,
-            headers=self._mineru_headers(),
             follow_redirects=True,
         )
         response.raise_for_status()
@@ -1049,10 +972,15 @@ class PDFParser(BaseParser):
         images: Dict[str, bytes],
         storage,
         resource_name: Optional[str],
-    ) -> int:
-        """Persist images into the media store, rewriting markdown references."""
+    ) -> Dict[str, str]:
+        """Persist images into the media store.
+
+        Returns the original-name -> stored-relative-path mapping so the caller can
+        rewrite the markdown references; a saved image whose reference is left
+        pointing at the provider's path is a broken link in the parsed document.
+        """
         if not images:
-            return 0
+            return {}
 
         if storage is None:
             from openviking_cli.utils.storage import get_storage
@@ -1074,7 +1002,7 @@ class PDFParser(BaseParser):
             except Exception as img_err:
                 logger.warning(f"Failed to save MinerU image {name}: {img_err}")
 
-        return len(repl)
+        return repl
 
     async def _convert_mineru(
         self,
@@ -1213,8 +1141,11 @@ class PDFParser(BaseParser):
 
         text = entry.get("md_content") or ""
         images = self._mineru_decode_inline_images(entry.get("images") or {})
-        meta["images_saved"] = await self._mineru_save_images(images, storage, resource_name)
-        logger.info(f"MinerU conversion: {len(text)} chars")
+        repl = await self._mineru_save_images(images, storage, resource_name)
+        meta["images_saved"] = len(repl)
+        for original, stored in repl.items():
+            text = text.replace(original, stored)
+        logger.info(f"MinerU conversion: {len(text)} chars, {len(repl)} images")
         return text, meta
 
     def _format_table_markdown(self, table: List[List[Optional[str]]]) -> str:

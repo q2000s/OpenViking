@@ -315,151 +315,132 @@ def test_hosted_batch_failure_falls_back_to_self_hosted(monkeypatch):
     assert meta["api_mode"] == "file-parse"
 
 
-async def _no_sleep(_seconds):
-    """Placeholder so retry backoff does not slow the suite down."""
-    return None
-
-
 # ---------------------------------------------------------------------------
-# batch behaviour: partial remote failure, backoff, and circuit breaking
+# regressions raised in review: default-config startup, credential isolation,
+# and image-reference rewriting
 # ---------------------------------------------------------------------------
 
 
-def _http_error(status):
-    """An error shaped like the real thing, with a response carrying the status."""
-    import httpx as _httpx
+def test_default_pdfconfig_reports_no_remote_provider():
+    """A deployment that never configured MinerU must still start.
 
-    request = _httpx.Request("POST", ENDPOINT)
-    response = _httpx.Response(status, request=request)
-    return _httpx.HTTPStatusError(f"HTTP {status}", request=request, response=response)
-
-
-def test_transient_errors_are_retried_then_fall_back(monkeypatch, pdf_path):
-    """A 429 is worth one backed-off retry; a 404 is not."""
-    for status, expected_calls in ((429, 2), (500, 2), (404, 1)):
-        calls = []
-
-        async def flaky(self, p, storage=None, resource_name=None, _calls=calls, _status=status):
-            _calls.append(1)
-            raise _http_error(_status)
-
-        async def ok_local(self, pdf_path, storage=None, resource_name=None):
-            return LOCAL_MD, {"strategy": "local"}
-
-        async def call_flaky(self, p, storage=None, resource_name=None):
-            return await flaky(self, p, storage, resource_name)
-
-        monkeypatch.setattr(PDFParser, "_convert_mineru", call_flaky)
-        monkeypatch.setattr(PDFParser, "_convert_local", ok_local)
-        monkeypatch.setattr(asyncio, "sleep", _no_sleep)
-
-        parser = _parser(strategy="auto", mineru_endpoint=ENDPOINT)
-        md, meta = asyncio.run(parser._convert_to_markdown(pdf_path))
-
-        assert md == LOCAL_MD, status
-        assert meta["strategy"] == "local", status
-        assert len(calls) == expected_calls, (status, len(calls))
-
-
-def test_circuit_opens_after_repeated_failures(monkeypatch, pdf_path):
-    """Once the remote is clearly down, stop paying for a doomed call per document."""
-    calls = []
-
-    async def always_fail(self, pdf_path, storage=None, resource_name=None):
-        calls.append(1)
-        raise _http_error(404)
-
-    async def ok_local(self, pdf_path, storage=None, resource_name=None):
-        return LOCAL_MD, {"strategy": "local"}
-
-    async def _stub_always_fail(self, p, storage=None, resource_name=None):
-        return await always_fail(self, p, storage, resource_name)
-
-    monkeypatch.setattr(PDFParser, "_convert_mineru", _stub_always_fail)
-    monkeypatch.setattr(PDFParser, "_convert_local", ok_local)
-
-    parser = _parser(strategy="auto", mineru_endpoint=ENDPOINT)
-    parser._remote_circuit_threshold = 3
-    parser._remote_circuit_cooldown = 1000  # stay open for this test's batch
-
-    for _ in range(10):
-        md, meta = asyncio.run(parser._convert_to_markdown(pdf_path))
-        assert md == LOCAL_MD
-        assert meta["strategy"] == "local"
-
-    # 3 documents opened the circuit; the other 7 never called the remote again.
-    assert len(calls) == 3, len(calls)
-
-
-def test_circuit_recovers_after_a_success(monkeypatch, pdf_path):
-    """A single success closes the circuit again."""
-    state = {"fail": True}
-
-    async def flaky(self, pdf_path, storage=None, resource_name=None):
-        if state["fail"]:
-            raise _http_error(404)
-        return MINERU_MD, {"strategy": "mineru"}
-
-    async def ok_local(self, pdf_path, storage=None, resource_name=None):
-        return LOCAL_MD, {"strategy": "local"}
-
-    async def _stub_flaky(self, p, storage=None, resource_name=None):
-        return await flaky(self, p, storage, resource_name)
-
-    monkeypatch.setattr(PDFParser, "_convert_mineru", _stub_flaky)
-    monkeypatch.setattr(PDFParser, "_convert_local", ok_local)
-
-    parser = _parser(strategy="auto", mineru_endpoint=ENDPOINT)
-    parser._remote_circuit_threshold = 2
-    parser._remote_circuit_cooldown = 1000
-
-    asyncio.run(parser._convert_to_markdown(pdf_path))
-    asyncio.run(parser._convert_to_markdown(pdf_path))
-    assert "MinerU" in parser._remote_circuit_open
-
-    state["fail"] = False
-    parser._remote_circuit_cooldown = 1  # let the next document through as a probe
-    md, meta = asyncio.run(parser._convert_to_markdown(pdf_path))
-    assert md == MINERU_MD
-    assert "MinerU" not in parser._remote_circuit_open
-
-
-def test_batch_with_partial_remote_failures(monkeypatch, tmp_path):
-    """10 documents, 3 fail remotely: the batch finishes and stays auditable.
-
-    This is the shape a real import hits -- a handful of bad documents must not take
-    down the run, and the operator needs to see that three of them degraded.
+    ``remote_enabled`` is read on the default ``auto`` path during service start-up,
+    so it has to cope with the default ``None`` endpoint instead of raising.
     """
-    failing = {"doc2.pdf", "doc5.pdf", "doc9.pdf"}
-    seen = []
+    from openviking_cli.utils.config.parser_config import PDFConfig
 
-    async def sometimes(self, pdf_path, storage=None, resource_name=None):
-        seen.append(pdf_path.name)
-        if pdf_path.name in failing:
-            raise _http_error(400)
-        return MINERU_MD, {"strategy": "mineru"}
+    config = PDFConfig()
+    assert config.mineru_endpoint is None
+    assert config.remote_enabled is False
 
-    async def ok_local(self, pdf_path, storage=None, resource_name=None):
-        return LOCAL_MD, {"strategy": "local"}
 
-    async def _stub_sometimes(self, p, storage=None, resource_name=None):
-        return await sometimes(self, p, storage, resource_name)
+def test_remote_enabled_true_only_for_a_configured_endpoint():
+    from openviking_cli.utils.config.parser_config import PDFConfig
 
-    monkeypatch.setattr(PDFParser, "_convert_mineru", _stub_sometimes)
-    monkeypatch.setattr(PDFParser, "_convert_local", ok_local)
+    config = PDFConfig()
+    config.mineru_endpoint = "https://mineru.example"
+    assert config.remote_enabled is True
 
-    parser = _parser(strategy="auto", mineru_endpoint=ENDPOINT)
-    effective = []
+    config.mineru_endpoint = ""
+    assert config.remote_enabled is False
 
-    for i in range(10):
-        doc = tmp_path / f"doc{i}.pdf"
-        doc.write_bytes(b"%PDF-1.4 minimal")
-        _, meta = asyncio.run(parser._convert_to_markdown(doc))
-        effective.append(meta["strategy"])
 
-    assert len(seen) == 10, seen
-    # Every document produced a result; the failures degraded rather than aborting.
-    assert effective.count("local") == len(failing)
-    assert effective.count("mineru") == 10 - len(failing)
-    # And the degradation is visible to operators.
-    assert parser._degraded == len(failing)
+def test_presigned_zip_download_carries_no_mineru_token(monkeypatch):
+    """The archive lives on the storage host, so the MinerU token must not go there."""
+    from openviking_cli.utils.config.parser_config import PDFConfig
+
+    parser = PDFParser(PDFConfig(mineru_endpoint=ENDPOINT, mineru_token="secret-token"))
+    seen = {}
+
+    class _Resp:
+        content = b"zip-bytes"
+
+        def raise_for_status(self):
+            return None
+
+    class _Client:
+        async def get(self, url, **kwargs):
+            seen["url"] = url
+            seen["headers"] = kwargs.get("headers")
+            seen["kwargs"] = kwargs
+            return _Resp()
+
+    zip_url = "https://oss.storage.example/batch/abc.zip?signature=deadbeef"
+    asyncio.run(parser._mineru_download_zip(_Client(), zip_url))
+
+    assert seen["url"] == zip_url
+    assert "headers" not in seen["kwargs"], "a token-bearing header must not be sent"
+    # The API headers still carry the token; they are simply not used for the
+    # cross-host download.
+    assert parser._mineru_headers()["Authorization"] == "Bearer secret-token"
+
+
+def test_self_hosted_images_are_saved_and_references_rewritten(monkeypatch, pdf_path):
+    """A saved image whose markdown still points at the provider path is broken."""
+    from openviking_cli.utils.config.parser_config import PDFConfig
+
+    monkeypatch.setattr(
+        PDFParser,
+        "_mineru_base_url",
+        lambda self: ENDPOINT,
+    )
+    monkeypatch.setattr(
+        PDFParser,
+        "_mineru_file_parse_url",
+        lambda self: ENDPOINT + "/file_parse",
+    )
+
+    markdown = "see ![fig](images/figure.png) for detail"
+    # /file_parse answers with results keyed by file name
+    payload = {
+        "results": {
+            pdf_path.name: {
+                "md_content": markdown,
+                "images": {"images/figure.png": "ZmFrZQ=="},
+            }
+        }
+    }
+
+    class _Resp:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return payload
+
+    class _Client:
+        async def post(self, *a, **kw):
+            return _Resp()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+    saved = {}
+
+    class _Storage:
+        media_dir = Path("/media")
+
+        def save_image(self, resource_name, blob, filename, extension):
+            target = Path("/media") / resource_name / (filename + extension)
+            saved["path"] = target
+            saved["blob"] = blob
+            return target
+
+    monkeypatch.setattr(
+        "openviking.parse.parsers.pdf.lazy_import",
+        lambda name: __import__("httpx") if name == "httpx" else None,
+        raising=False,
+    )
+    monkeypatch.setattr("httpx.AsyncClient", lambda *a, **kw: _Client())
+
+    parser = PDFParser(PDFConfig(strategy="mineru", mineru_endpoint=ENDPOINT))
+    text, meta = asyncio.run(parser._mineru_selfhosted(_Client(), {}, pdf_path, _Storage(), "math"))
+
+    assert meta["images_saved"] == 1
+    assert saved["path"].name == "figure.png"
+    # the reference must now resolve to where the image was actually written
+    assert "images/figure.png" not in text
+    assert "math/figure.png" in text

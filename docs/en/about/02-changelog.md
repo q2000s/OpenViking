@@ -7,13 +7,12 @@ This changelog is automatically generated from [GitHub Releases](https://github.
 
 ## Unreleased
 
-- **`auto` degrades cheaply when a remote parser is rate limited or down**: `429` and `5xx`
-  are retried once after a short backoff, permanent errors such as `404` skip the retry
-  and go straight to local, and a provider that fails repeatedly is circuit-broken so the
-  rest of the batch stops paying for a doomed call. The circuit half-opens after a
-  cooldown so a recovered service is picked up again. Documents that fell back are
-  counted in `pdf_remote_degraded`, and whether any remote parser is configured is now
-  `PDFConfig.remote_enabled`, expressed over the provider list rather than one service.
+- **`auto` falls back to local on any remote parser failure**: each configured remote
+  provider is tried in turn and the first success wins; a provider that raises is logged
+  and the next option is tried, so a remote outage degrades that document to local instead
+  of failing the import. The path actually taken is recorded in `pdf_strategy_effective`,
+  and whether any remote parser is configured is now `PDFConfig.remote_enabled`, expressed
+  over the provider list rather than one service.
 - **MinerU hosted API support (`mineru_token`)**: a new `pdf.mineru_token` setting carries
   the bearer token for the hosted MinerU service and, because that service has no
   `/file_parse` route, its presence also selects the hosted batch protocol:

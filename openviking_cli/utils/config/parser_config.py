@@ -179,9 +179,16 @@ class PDFConfig(ParserConfig):
         startup preflight, or the documentation. Keep this in step with the
         provider list built by ``PDFParser._remote_converters``.
         """
+        # Each entry is one provider's configured endpoint. A default ``None``
+        # must stay a member of a real collection: ``any(None)`` raises TypeError,
+        # which would break startup for deployments that never configured MinerU.
         return any(
-            self.mineru_endpoint,  # MinerU provider
-            # future providers register their own config here
+            endpoint
+            for endpoint in (
+                self.mineru_endpoint,  # MinerU provider
+                # future providers register their own config here
+            )
+            if endpoint
         )
 
     def validate(self) -> None:
