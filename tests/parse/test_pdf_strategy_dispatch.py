@@ -1202,3 +1202,123 @@ def test_local_image_rasteriser_skips_a_degenerate_box():
         parser._extract_image_from_page(_Page(), {"x0": 10, "top": 10, "x1": 10, "bottom": 40})
         is None
     )
+
+
+def test_selfhosted_preflight_rejects_a_response_that_is_not_json():
+    """A 200 that is not the health contract must still fail the preflight."""
+    import openviking.service.mineru_preflight as pf
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            raise ValueError("not json")
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+    pf.httpx.AsyncClient = lambda **kw: _Client()
+    try:
+        asyncio.run(pf.wait_for_mineru_ready("http://127.0.0.1:8000", timeout=0.2))
+    except RuntimeError as exc:
+        assert "preflight failed" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")
+
+
+def test_zip_image_save_failure_is_logged_and_skipped(pdf_path):
+    """One unwritable image must not lose the others or the document."""
+    archive = _zip_bytes(
+        {
+            "full.md": b"![a](images/a.png) ![b](images/b.png)",
+            "images/a.png": b"one",
+            "images/b.png": b"two",
+        }
+    )
+
+    class _Storage:
+        media_dir = Path("/media")
+
+        def save_image(self, resource_name, blob, filename, extension):
+            if filename == "a":
+                raise OSError("no space left")
+            return Path("/media") / resource_name / (filename + extension)
+
+    parser = _hosted_parser()
+    text, meta = parser._mineru_unpack_zip(archive, pdf_path, {}, _Storage(), "doc")
+    assert meta["images_saved"] == 1
+    assert "doc/b.png" in text
+    assert "images/a.png" in text  # the one that failed is left as-is, not mis-linked
+
+
+def test_failure_message_without_any_reason_just_names_the_file(tmp_path):
+    """A failed entry that reports nothing usable still names the document."""
+    msg = PDFParser._mineru_failure_message({"failed": True}, tmp_path / "x.pdf")
+    assert msg == "MinerU failed to convert x.pdf"
+
+
+def test_image_refs_skip_a_key_without_a_file_name():
+    """A key that is only a directory has nothing to match on."""
+    out = PDFParser._mineru_apply_image_refs("text images/ stays", {"images/": "doc/"})
+    assert out == "text images/ stays"
+
+
+# ---------------------------------------------------------------------------
+# startup preflight wiring
+# ---------------------------------------------------------------------------
+
+
+def test_preflight_settings_treat_a_token_as_the_hosted_api():
+    from openviking.service.core import mineru_preflight_settings
+
+    cfg = PDFConfig(
+        strategy="mineru",
+        mineru_endpoint="https://mineru.example/api/v4",
+        mineru_token="hosted-token",
+    )
+    endpoint, hosted, token = mineru_preflight_settings(cfg)
+    assert (endpoint, hosted, token) == ("https://mineru.example/api/v4", True, "hosted-token")
+
+
+def test_preflight_settings_keep_the_selfhosted_contract_without_a_token():
+    from openviking.service.core import mineru_preflight_settings
+
+    cfg = PDFConfig(strategy="mineru", mineru_endpoint="http://127.0.0.1:8000")
+    endpoint, hosted, token = mineru_preflight_settings(cfg)
+    assert (endpoint, hosted, token) == ("http://127.0.0.1:8000", False, None)
+
+
+def test_selfhosted_preflight_rejects_a_json_body_that_is_not_an_object():
+    """HTTP 200 with a non-object body is not the health contract."""
+    import openviking.service.mineru_preflight as pf
+
+    class _Resp:
+        status_code = 200
+
+        def json(self):
+            return ["not", "an", "object"]
+
+    class _Client:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *exc):
+            return False
+
+        async def get(self, url, **kw):
+            return _Resp()
+
+    pf.httpx.AsyncClient = lambda **kw: _Client()
+    try:
+        asyncio.run(pf.wait_for_mineru_ready("http://127.0.0.1:8000", timeout=0.2))
+    except RuntimeError as exc:
+        assert "unexpected response" in str(exc)
+    else:
+        raise AssertionError("expected RuntimeError")

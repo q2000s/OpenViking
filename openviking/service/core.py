@@ -64,6 +64,16 @@ if TYPE_CHECKING:
     from openviking.session.compressor_v3 import SessionCompressorV3
 
 
+def mineru_preflight_settings(pdf_config) -> tuple[str, bool, str | None]:
+    """Decide how the startup preflight should probe a configured MinerU endpoint.
+
+    Returns ``(endpoint, hosted, token)``. A token marks the hosted API, which serves
+    no ``/health`` route: probing it with the self-hosted health contract would fail
+    startup for a service that is reachable and correctly configured.
+    """
+    return pdf_config.mineru_endpoint, bool(pdf_config.mineru_token), pdf_config.mineru_token
+
+
 class OpenVikingService:
     """
     OpenViking main service class.
@@ -691,16 +701,9 @@ class OpenVikingService:
         )
 
         if should_preflight_mineru and pdf_config.mineru_endpoint:
-            # A token marks the hosted API, which has no /health route. Probing it
-            # with the self-hosted contract would fail startup for a service that is
-            # reachable and correctly configured.
-            hosted = bool(pdf_config.mineru_token)
+            endpoint, hosted, token = mineru_preflight_settings(pdf_config)
             try:
-                await wait_for_mineru_ready(
-                    pdf_config.mineru_endpoint,
-                    hosted=hosted,
-                    token=pdf_config.mineru_token,
-                )
+                await wait_for_mineru_ready(endpoint, hosted=hosted, token=token)
                 logger.info("MinerU preflight passed: %s", pdf_config.mineru_endpoint)
             except RuntimeError as exc:
                 if pdf_config.strategy == "mineru":
