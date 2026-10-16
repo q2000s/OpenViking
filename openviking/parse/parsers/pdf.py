@@ -1203,7 +1203,11 @@ class PDFParser(BaseParser):
 
         text = entry.get("md_content") or ""
         images = self._mineru_decode_inline_images(entry.get("images") or {})
-        repl = await self._mineru_save_images(images, storage, resource_name)
+        # Fall back to the PDF's own stem, matching the zip path. Falling back to the
+        # image name would put every document's images under one directory, so two
+        # PDFs carrying a file with the same name would overwrite each other.
+        image_dir = resource_name or pdf_path.stem
+        repl = await self._mineru_save_images(images, storage, image_dir)
         meta["images_saved"] = len(repl)
         text = self._mineru_apply_image_refs(text, repl)
         logger.info(f"MinerU conversion: {len(text)} chars, {len(repl)} images")

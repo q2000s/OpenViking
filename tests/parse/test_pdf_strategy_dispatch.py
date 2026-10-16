@@ -918,7 +918,7 @@ def test_parse_records_the_effective_strategy(monkeypatch, pdf_path):
 # ---------------------------------------------------------------------------
 
 
-def test_hosted_preflight_accepts_the_missing_health_route():
+def test_hosted_preflight_accepts_the_missing_health_route(monkeypatch):
     """The hosted API has no /health; a 404 there must not fail startup.
 
     Probing it with the self-hosted contract would reject a service that is up and
@@ -946,7 +946,7 @@ def test_hosted_preflight_accepts_the_missing_health_route():
             seen["headers"] = kw.get("headers")
             return _Resp()
 
-    pf.httpx.AsyncClient = lambda **kw: _Client()
+    monkeypatch.setattr(pf.httpx, "AsyncClient", lambda **kw: _Client())
     asyncio.run(
         pf.wait_for_mineru_ready(
             "https://mineru.example/api/v4", timeout=1, hosted=True, token="tok"
@@ -957,7 +957,7 @@ def test_hosted_preflight_accepts_the_missing_health_route():
     assert seen["headers"] == {"Authorization": "Bearer tok"}
 
 
-def test_hosted_preflight_still_rejects_a_rejected_token():
+def test_hosted_preflight_still_rejects_a_rejected_token(monkeypatch):
     import openviking.service.mineru_preflight as pf
 
     class _Resp:
@@ -976,7 +976,7 @@ def test_hosted_preflight_still_rejects_a_rejected_token():
         async def get(self, url, **kw):
             return _Resp()
 
-    pf.httpx.AsyncClient = lambda **kw: _Client()
+    monkeypatch.setattr(pf.httpx, "AsyncClient", lambda **kw: _Client())
     try:
         asyncio.run(
             pf.wait_for_mineru_ready(
@@ -989,7 +989,7 @@ def test_hosted_preflight_still_rejects_a_rejected_token():
         raise AssertionError("a rejected token must fail the preflight")
 
 
-def test_selfhosted_preflight_still_demands_the_health_contract():
+def test_selfhosted_preflight_still_demands_the_health_contract(monkeypatch):
     import openviking.service.mineru_preflight as pf
 
     class _Resp:
@@ -1008,7 +1008,7 @@ def test_selfhosted_preflight_still_demands_the_health_contract():
         async def get(self, url, **kw):
             return _Resp()
 
-    pf.httpx.AsyncClient = lambda **kw: _Client()
+    monkeypatch.setattr(pf.httpx, "AsyncClient", lambda **kw: _Client())
     asyncio.run(pf.wait_for_mineru_ready("http://127.0.0.1:8000", timeout=1))
 
 
@@ -1204,7 +1204,7 @@ def test_local_image_rasteriser_skips_a_degenerate_box():
     )
 
 
-def test_selfhosted_preflight_rejects_a_response_that_is_not_json():
+def test_selfhosted_preflight_rejects_a_response_that_is_not_json(monkeypatch):
     """A 200 that is not the health contract must still fail the preflight."""
     import openviking.service.mineru_preflight as pf
 
@@ -1224,7 +1224,7 @@ def test_selfhosted_preflight_rejects_a_response_that_is_not_json():
         async def get(self, url, **kw):
             return _Resp()
 
-    pf.httpx.AsyncClient = lambda **kw: _Client()
+    monkeypatch.setattr(pf.httpx, "AsyncClient", lambda **kw: _Client())
     try:
         asyncio.run(pf.wait_for_mineru_ready("http://127.0.0.1:8000", timeout=0.2))
     except RuntimeError as exc:
@@ -1295,7 +1295,7 @@ def test_preflight_settings_keep_the_selfhosted_contract_without_a_token():
     assert (endpoint, hosted, token) == ("http://127.0.0.1:8000", False, None)
 
 
-def test_selfhosted_preflight_rejects_a_json_body_that_is_not_an_object():
+def test_selfhosted_preflight_rejects_a_json_body_that_is_not_an_object(monkeypatch):
     """HTTP 200 with a non-object body is not the health contract."""
     import openviking.service.mineru_preflight as pf
 
@@ -1315,10 +1315,132 @@ def test_selfhosted_preflight_rejects_a_json_body_that_is_not_an_object():
         async def get(self, url, **kw):
             return _Resp()
 
-    pf.httpx.AsyncClient = lambda **kw: _Client()
+    monkeypatch.setattr(pf.httpx, "AsyncClient", lambda **kw: _Client())
     try:
         asyncio.run(pf.wait_for_mineru_ready("http://127.0.0.1:8000", timeout=0.2))
     except RuntimeError as exc:
         assert "unexpected response" in str(exc)
     else:
         raise AssertionError("expected RuntimeError")
+
+
+# ---------------------------------------------------------------------------
+# regressions: image directory collisions and test isolation
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStorage:
+    """Storage that remembers every (resource_name, filename) it was asked to save."""
+
+    def __init__(self):
+        self.media_dir = Path("/media")
+        self.saved = {}
+
+    def save_image(self, resource_name, blob, filename, extension):
+        target = Path("/media") / resource_name / (filename + extension)
+        # a later document writing the same path overwrites the earlier bytes
+        self.saved[target.as_posix()] = blob
+        return target
+
+
+def _b64(payload: bytes) -> str:
+    import base64 as _b
+
+    return "data:image/png;base64," + _b.b64encode(payload).decode("ascii")
+
+
+def _selfhosted_client(markdown, image_bytes):
+    """A /file_parse reply carrying one inline image."""
+    import base64 as _b
+
+    encoded = "data:image/png;base64," + _b.b64encode(image_bytes).decode("ascii")
+
+    class _Client:
+        async def post(self, *a, **kw):
+            return _FakeResponse(
+                {
+                    "results": {
+                        "doc.pdf": {
+                            "md_content": markdown,
+                            "images": {"images/figure.png": encoded},
+                        }
+                    }
+                }
+            )
+
+    return _Client()
+
+
+def test_two_pdfs_with_the_same_image_name_do_not_overwrite(tmp_path):
+    """Without a resource_name each PDF's images must land in its own directory.
+
+    Both documents carry an images/figure.png. Falling back to the image name would
+    send both to figure/ and the second would overwrite the first.
+    """
+    storage = _RecordingStorage()
+    parser = _parser(strategy="mineru", mineru_endpoint="https://mineru.example")
+
+    results = {}
+    for name, payload in (("alpha", b"alpha-bytes"), ("beta", b"beta-bytes")):
+        pdf = tmp_path / f"{name}.pdf"
+        pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+        text, _meta = asyncio.run(
+            parser._mineru_selfhosted(
+                _selfhosted_client("![f](images/figure.png)", payload),
+                {},
+                pdf,
+                storage,
+                None,  # no resource_name: the parser must choose one
+            )
+        )
+        results[name] = text
+
+    # each markdown points into its own document directory
+    assert "alpha/figure.png" in results["alpha"]
+    assert "beta/figure.png" in results["beta"]
+    assert "images/figure.png" not in results["alpha"]
+
+    # and neither document clobbered the other's bytes
+    assert storage.saved["/media/alpha/figure.png"] == b"alpha-bytes"
+    assert storage.saved["/media/beta/figure.png"] == b"beta-bytes"
+
+
+def test_an_explicit_resource_name_still_wins(tmp_path):
+    storage = _RecordingStorage()
+    parser = _parser(strategy="mineru", mineru_endpoint="https://mineru.example")
+    pdf = tmp_path / "gamma.pdf"
+    pdf.write_bytes(b"%PDF-1.4\n%%EOF\n")
+
+    text, _meta = asyncio.run(
+        parser._mineru_selfhosted(
+            _selfhosted_client("![f](images/figure.png)", b"bytes"),
+            {},
+            pdf,
+            storage,
+            "chosen",
+        )
+    )
+    assert "chosen/figure.png" in text
+    assert list(storage.saved) == ["/media/chosen/figure.png"]
+
+
+def test_preflight_tests_do_not_leak_a_fake_http_client():
+    """The preflight tests must restore the real httpx.AsyncClient.
+
+    ``pf.httpx`` is the shared httpx module, so assigning to it replaces the client
+    for every later test in the process.
+    """
+    import openviking.service.mineru_preflight as pf
+
+    assert getattr(pf.httpx.AsyncClient, "__module__", "") == "httpx", (
+        "httpx.AsyncClient is still patched after the preflight tests ran"
+    )
+
+
+def test_preflight_tests_do_not_leak_a_fake_client_object():
+    """A second guard: the attribute must be httpx's own, not a lambda from a test."""
+    import httpx
+
+    import openviking.service.mineru_preflight as pf
+
+    assert pf.httpx.AsyncClient is httpx.AsyncClient
