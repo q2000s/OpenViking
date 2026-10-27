@@ -385,6 +385,8 @@ OpenAI 已于 2026 年 8 月 31 日[停止在 ChatGPT 登录的 Codex 中提供 
 
 使用 `input: "multimodal"` 时，OpenViking 可以嵌入文本、图片（PNG、JPG 等）和混合内容。以图搜图需要该模式；纯文本 embedding 模型仍会索引图片 summary，但不能接收图片查询。
 
+Hybrid 是否支持图片取决于 dense 通道。图文完整输入进入 dense，sparse 只接收文字；纯图输入跳过 sparse。Volcengine hybrid 对纯文本保留一次合并请求，对图文分别请求多模态 dense 和文本 sparse。dense 模型和维度应与索引中已有的向量保持兼容。
+
 **支持的 provider:**
 - `openai`: OpenAI Embedding API
 - `azure`: Azure OpenAI Embedding API
@@ -568,7 +570,7 @@ SDK 1.39.0 起提供所需的客户端上下文管理器和关闭方法，用于
     "dense": {
       "provider": "gemini",
       "api_key": "your-google-api-key",
-      "model": "gemini-embedding-2-preview",
+      "model": "gemini-embedding-2",
       "dimension": 3072
     }
   }
@@ -576,11 +578,15 @@ SDK 1.39.0 起提供所需的客户端上下文管理器和关闭方法，用于
 ```
 
 可用 Gemini 嵌入模型:
-- `gemini-embedding-2-preview`: 8192 token 输入限制, 1–3072 输出维度 (MRL)
+- `gemini-embedding-2`: 8192 token 输入限制, 1–3072 输出维度 (MRL)
 - `gemini-embedding-001`: 2048 token 输入限制, 1–3072 输出维度 (MRL)
 - `text-embedding-004`: 2048 token 输入限制, 768 输出维度（固定）
 
 推荐维度: `768`、`1536` 或 `3072`（默认: `3072`）。
+
+稳定版 Gemini Embedding 2 不接受 `task_type` 请求字段，而是使用文档规定的文本任务指令。
+配置 `query_param` 或 `document_param` 后，OpenViking 会自动添加相应指令。如果修改已有索引的
+embedding 模型，除非 provider 明确保证两个向量空间兼容，否则应重新生成该索引的向量。
 
 获取 API Key: https://aistudio.google.com/apikey
 
@@ -643,7 +649,7 @@ SDK 1.39.0 起提供所需的客户端上下文管理器和关闭方法，用于
     "dense": {
       "provider": "gemini",
       "api_key": "your-google-api-key",
-      "model": "gemini-embedding-2-preview",
+      "model": "gemini-embedding-2",
       "dimension": 3072,
       "query_param": "RETRIEVAL_QUERY",
       "document_param": "RETRIEVAL_DOCUMENT"
@@ -935,6 +941,8 @@ VLM 的 `model` 填写对应的方舟模型 endpoint ID。`video_fps` 仅用于�
 
 三个并发配置项必须为正整数；省略或设为 `null` 时继承默认值。`shuffle_batch_size` 必须为正整数，省略时为 `4`，不接受 `null`。路由逐条保存合法结果，仅失败记录重新组批重试，最后一次降为单条；每条记录最多尝试三轮。修改后需重启 VikingBot 服务。一个 VikingBot 服务内的所有 Compile 任务仍共享 `vlm.max_concurrent` 限制的模型请求容量，因此提高阶段并发不会突破这一总上限。Embedding 请求另受 embedding 服务的并发限制。恢复任务默认使用相同的 reduce 配置，显式 `--concurrency` 可覆盖恢复并发数。
 
+Compile 继承模型的 thinking 和 reasoning 配置。模型请求使用有效模型超时配置（`bot.agents.timeout` 或继承的 `vlm.timeout`）。
+
 ### query_planner
 
 可选的轻量模型配置，用于检索前的意图分析和 query 规划/改写。配置结构与 `vlm` 相同，用于 `search()` 的意图分析、query expansion，以及可选的服务端 recall 摘要重写。未配置或配置为空时，OpenViking 会回退到 `vlm`，保持向后兼容。
@@ -1174,7 +1182,7 @@ PDF 解析配置。支持三种策略：`local`（本地 pdfplumber）、`mineru
   "rerank": {
     "provider": "jev",
     "api_key": "your-vercel-ai-gateway-api-key",
-    "api_base": "https://ai-gateway.vercel.sh/typesafe",
+    "api_base": "https://ai-gateway.vercel.sh/typesafe/v1/systemone",
     "model": "typesafe-ai/jev",
     "threshold": 0.1
   }
@@ -1212,13 +1220,13 @@ Jev 适配器将 query 和候选文档作为共享的 System One `state`，支�
 | `sk` | str | VikingDB Secret Key（仅 `vikingdb` 提供方使用） |
 | `model_name` | str | 模型名称（仅 `vikingdb` 提供方使用，默认：`doubao-seed-rerank`） |
 | `api_key` | str | API Key（用于 `openai`、`cohere` 或 `jev` 提供方） |
-| `api_base` | str | 接口地址（用于 `openai` 或 `jev`；Jev 默认为 `https://api.typesafe.ai`，Vercel 使用 `https://ai-gateway.vercel.sh/typesafe`） |
+| `api_base` | str | 完整接口地址（用于 `openai` 或 `jev`；Jev 默认为 `https://api.typesafe.ai/v1/systemone`，Vercel 使用 `https://ai-gateway.vercel.sh/typesafe/v1/systemone`；自定义 Jev URL 会原样使用） |
 | `model` | str | 模型名称（用于 OpenAI 兼容、LiteLLM 或 `jev` 提供方） |
 | `mode` | `"noul"`、`"choice"` 或 `null` | Jev Rerank 模式；省略或 `null` 时使用 `"noul"` |
 | `timeout` | float | HTTP Rerank provider（包括 Jev）的请求超时时间，单位为秒。默认：`30.0` |
 | `max_input_tokens` | int | 每个 query-document 对发送给 reranker 的最大估算原始文本 token 数；超长输入会保留开头和结尾。`0` 表示不截断。默认：`0` |
 | `log_payloads` | bool | 记录完整 rerank 请求和响应；日志可能包含 query 和文档内容。默认：`false` |
-| `threshold` | float | 分数阈值，范围为 `0.0` 到 `1.0`。低于此值的结果会被过滤。默认：`0.1` |
+| `threshold` | float | Rerank 分数阈值，范围为 `0.0` 到 `1.0`。Rerank 后低于此值的结果会被过滤；它不过滤向量分数（未使用 Rerank 或 Rerank 失败时），请求中的 `score_threshold` 优先。默认：`0.1` |
 | `extra_headers` | object | 自定义 HTTP 请求头（OpenAI 兼容 provider 可用，可选） |
 
 **支持的提供方:**
@@ -1238,6 +1246,7 @@ Jev 适配器将 query 和候选文档作为共享的 System One `state`，支�
 {
   "retrieval": {
     "enable_intent": true,
+    "apply_rerank_to_context": false,
     "recall_intent_timeout_s": 5.0,
     "recall_rewrite_timeout_s": 30.0
   }
@@ -1247,6 +1256,7 @@ Jev 适配器将 query 和候选文档作为共享的 System One `state`，支�
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
 | `enable_intent` | bool | `search()` 收到 `session_id` 时是否执行意图分析和查询规划。 | `true` |
+| `apply_rerank_to_context` | bool | 是否用已配置的 [`rerank`](#rerank) 模型重排 `mode="context"` 的候选：每个请求用原始查询及其扩展查询统一重排一次，在配额和 token 预算之前执行。需要可用的 `rerank` 配置；图像查询保持向量分数。 | `false` |
 
 普通 `search()` 的会话意图分析和 `mode="context"` 的查询扩展共用 `recall_intent_timeout_s`；上下文 digest 重写使用独立的超时配置：
 
@@ -1307,6 +1317,7 @@ Glob 引擎配置，用于路径模式匹配。这些设置为服务端配置，
 | `skip_process_lock` | bool | 是否跳过本地向量后端（`local`、`cuvs`）对 `storage.workspace` 的 `.openviking.lock` 独占文件锁。其他后端不会获取此锁。跳过检查不代表本地向量存储支持多进程共享。 | `false` |
 | `agfs` | object | RAGFS（Rust 实现的 AGFS）配置 | {} |
 | `vectordb` | object | 向量库存储配置 | {} |
+| `task_store` | object | 持久化 Task/Work 后端配置 | `{"provider":"file"}` |
 
 
 ```json
@@ -1323,6 +1334,46 @@ Glob 引擎配置，用于路径模式匹配。这些设置为服务端配置，
   }
 }
 ```
+
+#### task_store
+
+Task 记录默认使用本地 FileStore。需要多个 OpenViking 进程共享
+Task/Work 状态时，先在 MySQL 中执行
+`openviking/service/sql/task_store_init.sql`，再按顺序执行
+`openviking/service/sql/changes/` 下的变更脚本，配置稳定的顶层
+`service_name` 后选择关系型后端：
+
+```json
+{
+  "service_name": "production",
+  "storage": {
+    "task_store": {
+      "provider": "mysql",
+      "params": {
+        "user": "openviking",
+        "password": "change-me",
+        "database": "openviking",
+        "host": "127.0.0.1",
+        "port": 3306,
+        "table": "ov_tasks"
+      }
+    }
+  }
+}
+```
+
+`params.table` 是表前缀，必须以 ASCII 字母开头，只能包含 ASCII 字母、数字和
+下划线，最多 38 个字符，确保派生的表名、索引名和约束名不超过 MySQL 的 64 字符上限。
+使用自定义前缀时，需要在建表 SQL 中统一替换 `ov_tasks`。
+
+MySQL 后端需要安装 `openviking[mysql]` extra。Task mutation、Task
+最终化和 execution event 更新在同一个数据库事务中提交。`task_id`
+在同一个 `service_name` 分区内唯一；顶层 `service_name` 会写入每条
+Task/Work/Event 记录，用于隔离共用同一套表的多个 OpenViking 部署。
+`account_id` 和 `user_id` 用于鉴权和查询范围。新库需要先执行 init SQL，
+再按顺序执行变更脚本；升级使用旧 TaskStore 表的库前，先执行
+`openviking/service/sql/changes/0001_task_store_service_name.sql`。同一部署
+不要同时让 FileStore 和 MySQL 表作为写入端。
 
 #### agfs (RAGFS)
 
@@ -1356,6 +1407,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
       "backups": {
         "initial_partitions": 16,
         "checkpoint_interval_secs": 86400,
+        "reconcile_existing_data": false,
         "provider": "filesystem",
         "items": [
           {
@@ -1378,6 +1430,7 @@ RAGFS 默认使用 Rust binding 模式，通过 Rust 实现直接访问文件系
 |------|------|------|--------|
 | `initial_partitions` | int | account 首次初始化的 metadata partition 数；修改不影响已有 account | `16` |
 | `checkpoint_interval_secs` | int | Checkpoint 扫描间隔，最小值为 `60` | `86400` |
+| `reconcile_existing_data` | bool | 首次启用多写时，扫描 primary 已存在文件并写入 V2 metadata。仅在 backup 已对齐或明确跳过历史回填时保持 `false`。 | `false` |
 | `provider` | str | Metadata provider：`filesystem` 或复用顶层 CacheRuntime 的 `cache` | `"filesystem"` |
 | `items` | array | backup 列表，包含 `name`、`backend`、`params` 和可选 `encryption` | `[]` |
 
@@ -1412,9 +1465,19 @@ Redis 命名空间。
 
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
-| `provider` | str | `filesystem`、`memory` 或 `cache`；`cache` 复用 Redis CacheRuntime | `filesystem` |
+| `provider` | str | `filesystem`、`memory`、`sqlite` 或 `cache`；`cache` 复用 Redis CacheRuntime | `filesystem` |
+| `sqlite_path` | str / null | 可显式覆盖本地共享锁数据库的绝对路径。见 [SQLite 配置](../configuration/01-server.md#storage) | 使用 `sqlite` 时为 `{storage.workspace}/_system/pathlock/pathlock.db` |
 | `lock_expire_secs` | float | 未刷新的锁进入 stale 状态前的秒数；不得小于 `1.0` | `30.0` |
 | `lock_timeout_secs` | float | 已废弃且忽略；运行时等待超时固定为 `0.0` | `0.0` |
+
+SQLite PathLock 仅适用于同一主机上的进程共享同一个本地磁盘数据库文件。
+不能将数据库放在 EFS/NFS/SMB，也不能为每个副本配置独立的容器本地数据库。
+workspace 位于 EFS 时，默认 `sqlite_path` 也会落在 EFS。
+详见 [SQLite 部署限制](../configuration/01-server.md#storage)。
+
+多个容器或主机共享 EFS 时，使用下面的共享 Redis PathLock 配置。
+所有副本必须连接同一个 Redis 部署，并使用相同的顶层 `service_name` 和锁过期配置。
+示例同时使用 Redis QueueFS，避免默认的 SQLite 队列数据库落在 EFS。
 
 ```json
 {
@@ -1475,8 +1538,7 @@ Redis 命名空间。
 - Redis Sentinel 模式的 endpoints 是 Sentinel 节点，并且必须配置非空 `master_name`；master 发现和故障切换后的重连由 Fred RedisProvider 处理。
 - `username` 和 `password` 用于 Redis 数据节点；`sentinel_username` 和 `sentinel_password` 仅用于 Sentinel 节点。
 - Cache backend 使用 `{service_name}:ov:*` key；连接同一 Redis 集群的不同部署必须配置不同的 `service_name`。
-- Cache backend 的实例心跳 TTL 为 30 秒，每 10 秒续约一次。
-- Cache backend 会在独立的 startup recovery 任务中按实例心跳状态执行三次有界 `recover_stale` 扫描，时间点分别为启动后立即、30 秒和 60 秒，用于覆盖容器异常退出后旧实例心跳尚未过期的恢复窗口；正常关闭会先删除 heartbeat，使新实例可以立即恢复 processing 消息。
+- Cache backend 的实例心跳 TTL 为 30 秒，每 10 秒续约一次。同一 QueueFS cache namespace 中只有一个存活实例持有经 token 校验的 30 秒 leader lease，并每 10 秒扫描过期的 `processing` 消息；该实例停止后，其他实例会在 lease 到期后接管。正常关闭会删除 heartbeat，因此恢复可以立即开始。
 - 所有 Redis 读命令都发送到主节点，不提供副本读配置。
 - `tls_insecure_skip_verify=true` 时 endpoint 必须使用 `rediss://`。
 - 如果同时设置了 `storage.agfs.queuefs.db_path` 和旧字段 `storage.agfs.queue_db_path`，以前者为准。
@@ -1962,7 +2024,7 @@ ov add-resource ./docs --exclude "*.tmp"
 | `profile_enabled` | bool | 是否允许 HTTP 请求通过 `profile=1` 开启请求级 cProfile。关闭时服务端会忽略该请求参数；开启后，CLI 可以显示返回的 `profile`，而 Python HTTP client 默认只触发服务端 profile，不会把顶层 `profile` 字段自动附着到大多数 SDK 返回值上。 | `false` |
 | `cors_origins` | list | CORS 允许的来源 | `["*"]` |
 | `public_base_url` | str | MCP `add_resource` 和 `add_skill` 工具向客户端返回的上传指令里使用的对外可见 base URL。解析顺序：环境变量 `OPENVIKING_PUBLIC_BASE_URL` → 本字段 → 请求头 `X-Forwarded-Host` / `X-Forwarded-Proto` → 请求头 `Host` → 监听地址兜底。当 server 部署在反向代理后且代理不转发 `X-Forwarded-*` 时，请显式设置本字段（或环境变量）。 | `null` |
-| `upload_signed_ttl_seconds` | int | MCP `add_resource` 和 `add_skill` 为本地文件上传 mint 的一次性 token 的过期时间（秒），走 `POST /api/v1/resources/temp_upload?token=...`。 | `600`（10 分钟） |
+| `upload_signed_ttl_seconds` | int | MCP `add_resource` 和 `add_skill` 为本地文件上传 mint 的一次性 token 的过期时间（秒），走 `POST /api/v1/resources/temp_upload?token=...`；MCP `download` 为 `GET /api/v1/content/download?token=...` mint 的一次性 token 也用这个时长。 | `600`（10 分钟） |
 | `temp_upload.default_mode` | str | `POST /api/v1/resources/temp_upload` 的服务端默认模式（客户端未显式传 `upload_mode` 时使用）：`"local"`（仅当前实例本地磁盘，单机默认行为）或 `"shared"`（分布式共享存储，多副本部署可跨实例消费）。新的 shared 上传会固定写入内部 `viking://upload/<created_at_ms>-<uuid>/content` 和 `meta` 对象，在 `ttl_seconds` 指定的时间内可重复消费。 | `"local"` |
 | `temp_upload.shared_max_size_bytes` | int | `shared` 模式下接受的最大文件大小（字节）。超过此阈值的请求会在写入对象存储之前被拒绝。 | `536870912`（512 MiB） |
 | `temp_upload.ttl_seconds` | int | local 和 shared 临时上传文件共用的保留时间（秒）。每次对应模式的上传会清理超过此时间的文件；shared 只需一次上传根目录列举，从每个一级目录名解析创建时间，并递归删除过期目录，不依赖文件系统修改时间；设为 `0` 时禁用自动清理。 | `43200`（12 小时） |
@@ -2183,7 +2245,7 @@ Redis 连接和命令超时通过 `cache.params.connect_timeout_ms` 和
 | `provider` | str | 密钥提供程序：`"local"`、`"vault"` 或 `"volcengine_kms"` | - |
 | `api_key_hashing.enabled` | bool | 仅 File Provider：是否对 API key 字段启用 Argon2id 单向哈希（与文件级 `enabled` 独立控制），详见 [加密指南](./08-encryption.md) | `false` |
 
-### Local（本地文件）
+### Local
 
 适合开发环境和单节点部署：
 
@@ -2202,6 +2264,10 @@ Redis 连接和命令超时通过 `cache.params.connect_timeout_ms` 和
 | 参数 | 类型 | 说明 | 默认值 |
 |------|------|------|--------|
 | `local.key_file` | str | 根密钥文件路径 | `~/.openviking/master.key` |
+| `local.root_key` | str | 直接配置的 32 字节根密钥，必须编码为恰好 64 个十六进制字符 | - |
+
+不要同时配置 `local.key_file` 和 `local.root_key`。如果两者都省略，`local.key_file` 默认使用
+`~/.openviking/master.key`。内联密钥的管理和安全要求详见[加密指南](./08-encryption.md)。
 
 ### Vault（HashiCorp Vault）
 

@@ -612,7 +612,12 @@ export class OpenVikingClient {
   /** Remove a resource or directory. */
   remove(
     uri: string,
-    options: { recursive?: boolean; wait?: boolean } = {},
+    options: {
+      recursive?: boolean;
+      wait?: boolean;
+      /** @deprecated Accepted for compatibility and ignored. */
+      timeout?: number;
+    } = {},
   ): Promise<void> {
     return this.request("DELETE", "/api/v1/fs", {
       query: {
@@ -708,6 +713,7 @@ export class OpenVikingClient {
       wait: options.wait,
       telemetry: options.telemetry,
       processing_mode: options.processingMode,
+      defer_processing: options.deferProcessing,
     });
     return this.request("POST", "/api/v1/content/batch-write", {
       body: mergeExtra(body, options.extra),
@@ -1078,8 +1084,11 @@ export class OpenVikingClient {
       },
     });
   }
-  /** Wait for queued processing to finish. */
-  waitProcessed(): Promise<JsonObject> {
+  /**
+   * Wait for queued processing to finish.
+   * @param timeout - Deprecated. Accepted for compatibility and ignored.
+   */
+  waitProcessed(timeout?: number): Promise<JsonObject> {
     return this.request("POST", "/api/v1/system/wait", {
       body: {},
     });
@@ -1249,6 +1258,10 @@ export class OpenVikingClient {
       `/api/v1/admin/accounts/${pathPart(accountId)}`,
     );
   }
+  /** Return credential-free metadata for one account; rejects with NOT_FOUND if absent. */
+  adminGetAccount(accountId: string): Promise<JsonObject> {
+    return this.request("GET", `/api/v1/admin/accounts/${pathPart(accountId)}`);
+  }
   /** Register a user in an account. */
   adminRegisterUser(
     accountId: string,
@@ -1296,6 +1309,13 @@ export class OpenVikingClient {
   adminRemoveUser(accountId: string, userId: string): Promise<JsonObject> {
     return this.request(
       "DELETE",
+      `/api/v1/admin/accounts/${pathPart(accountId)}/users/${pathPart(userId)}`,
+    );
+  }
+  /** One user's credential-free membership info (user_id, role); rejects NOT_FOUND if absent. Never returns api_key/key_prefix. */
+  adminGetUser(accountId: string, userId: string): Promise<JsonObject> {
+    return this.request(
+      "GET",
       `/api/v1/admin/accounts/${pathPart(accountId)}/users/${pathPart(userId)}`,
     );
   }

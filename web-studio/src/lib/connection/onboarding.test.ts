@@ -52,15 +52,20 @@ describe('first-use detection', () => {
     )
     expect(needsStudioSetup()).toBe(true)
   })
-  it('shows workspace choice even when a profile or legacy connection exists', () => {
+  it('restores a legacy connection even after the upgrade marked setup pending', () => {
+    localStorage.setItem(SETUP_STORAGE_KEY, 'pending')
     localStorage.setItem('ov_console_connection', JSON.stringify(draft))
-    expect(needsStudioSetup()).toBe(true)
-    localStorage.clear()
+    expect(needsStudioSetup()).toBe(false)
+  })
+  it('restores saved profiles in a new tab without a session marker', () => {
     localStorage.setItem(
       PROFILES_STORAGE_KEY,
-      JSON.stringify({ profiles: [{ connection: draft }] }),
+      JSON.stringify({
+        activeId: 'saved',
+        profiles: [{ id: 'saved', name: 'Saved', connection: draft }],
+      }),
     )
-    expect(needsStudioSetup()).toBe(true)
+    expect(needsStudioSetup()).toBe(false)
   })
   it('does not treat an automatically persisted empty same-origin connection as configured', () => {
     localStorage.setItem(
@@ -76,9 +81,11 @@ describe('first-use detection', () => {
     )
     expect(needsStudioSetup()).toBe(false)
     expect(sessionStorage.getItem(WORKSPACE_SESSION_KEY)).toBe('selected')
+    sessionStorage.clear()
+    expect(needsStudioSetup()).toBe(false)
     localStorage.removeItem(PROFILES_STORAGE_KEY)
+    expect(needsStudioSetup()).toBe(false)
     localStorage.removeItem('ov_console_connection')
-    sessionStorage.removeItem(WORKSPACE_SESSION_KEY)
     expect(needsStudioSetup()).toBe(true)
   })
   it('completes setup when randomUUID is unavailable on an HTTP origin', () => {
@@ -320,4 +327,69 @@ describe('management bootstrap', () => {
       studioSetupDestination({ ...draft, serviceSelection: 'volcengine' }),
     ).toBe('/filesystem')
   })
+})
+
+it.each([
+  ['root', 'chosen-account'],
+  ['admin', 'bound-account'],
+])(
+  'keeps the selected user when verifying a %s control credential',
+  async (role, expectedAccount) => {
+    get
+      .mockResolvedValueOnce({
+        data: {
+          version: 'test',
+          auth_mode: 'api_key',
+          role,
+          account_id: role === 'root' ? 'default' : 'bound-account',
+          user_id: 'default',
+        },
+      })
+      .mockResolvedValueOnce({
+        status: 200,
+        headers: {},
+        data: { status: 'ok', result: [] },
+      })
+    const result = await verifyStudioSetup(
+      {
+        ...draft,
+        apiKey: '',
+        adminApiKey: 'control-key',
+        accountId: 'chosen-account',
+        userId: 'alice',
+      },
+      new AbortController().signal,
+    )
+    expect(result.accountId).toBe(expectedAccount)
+    expect(result.userId).toBe('alice')
+    expect(result.apiKey).toBe('')
+    expect(get.mock.calls[1][0].path.account_id).toBe(expectedAccount)
+  },
+)
+
+it('uses the User API Key identity when a separate control key is also configured', async () => {
+  get
+    .mockResolvedValueOnce({
+      data: {
+        version: 'test',
+        auth_mode: 'api_key',
+        role: 'user',
+        account_id: 'user-account',
+        user_id: 'alice',
+      },
+    })
+    .mockResolvedValueOnce({
+      status: 200,
+      headers: {},
+      data: { status: 'ok', result: [] },
+    })
+  const result = await verifyStudioSetup(
+    { ...draft, adminApiKey: 'control-key' },
+    new AbortController().signal,
+  )
+  expect(result.accountId).toBe('user-account')
+  expect(result.userId).toBe('alice')
+  expect(vi.mocked(createClient).mock.calls[0][0]?.headers?.['X-API-Key']).toBe(
+    'synthetic-key',
+  )
 })

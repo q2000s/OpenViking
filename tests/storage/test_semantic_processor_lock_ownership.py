@@ -12,8 +12,10 @@ from unittest.mock import AsyncMock
 
 import pytest
 
+from openviking.storage.errors import InvalidPathLockRequestError
 from openviking.storage.queuefs.process_result import ProcessOutcome
 from openviking.storage.queuefs.semantic_executor import SemanticTreeStats
+from openviking.storage.queuefs.semantic_lock import SemanticLockScope
 from openviking.storage.queuefs.semantic_msg import SemanticMsg
 from openviking.storage.queuefs.semantic_processor import SemanticProcessor
 
@@ -71,6 +73,41 @@ async def test_memory_semantic_directory_does_not_release_borrowed_lock(monkeypa
     )
 
     assert pathlock.release_calls == []
+
+
+@pytest.mark.asyncio
+async def test_semantic_lock_reacquires_unicode_coverage_after_legacy_mapping_error(monkeypatch):
+    covered_path = "/local/default/resources/agent-memory/credit-risk/信贷风险管理_1.md"
+    lock_path = (
+        "/local/default/resources/agent-memory/credit-risk/.exact.ovlock.1.md.14dd8bad93aaa5b0"
+    )
+    lease = {"id": "reacquired-lock"}
+    pathlock = SimpleNamespace(
+        pathlock_adopt=AsyncMock(
+            side_effect=InvalidPathLockRequestError(
+                f"invalid lock request: handoff coverage '{covered_path}' "
+                f"does not map to lock path '{lock_path}'"
+            )
+        ),
+        pathlock_acquire_batch=AsyncMock(return_value=lease),
+        pathlock_release=AsyncMock(),
+    )
+    monkeypatch.setattr(
+        "openviking.storage.queuefs.semantic_lock.get_viking_fs",
+        lambda: _FakeVikingFS(pathlock),
+    )
+    handoff = {
+        "owner_id": "legacy-owner",
+        "lock_paths": [lock_path],
+        "covered_paths": [{"path": covered_path, "kind": "tree"}],
+    }
+
+    scope = await SemanticLockScope.resolve(handoff)
+
+    assert scope.lock == lease
+    pathlock.pathlock_acquire_batch.assert_awaited_once_with(handoff["covered_paths"])
+    await scope.close()
+    pathlock.pathlock_release.assert_awaited_once_with(lease)
 
 
 def test_semantic_tree_stats_aggregate_multiple_plans_for_one_request():
@@ -167,7 +204,6 @@ async def test_shared_scheduler_drains_each_messages_embeddings_before_unlock(
     from openviking.service.task_store import PersistentTaskStore
     from openviking.service.task_tracker import TaskStatus, TaskTracker
     from openviking.service.task_work_index import (
-        TaskWorkIndex,
         bind_task_context,
         extract_task_metadata,
     )
@@ -210,8 +246,6 @@ async def test_shared_scheduler_drains_each_messages_embeddings_before_unlock(
         monkeypatch.setattr(f"openviking.storage.queuefs.{module}.get_viking_fs", lambda: fs)
     agfs = _FakeAgfs()
     tracker = TaskTracker(PersistentTaskStore(agfs))
-    index = TaskWorkIndex()
-    tracker.attach_work_index(index)
     monkeypatch.setattr("openviking.service.task_tracker._instance", tracker)
     entered_embedding_drain = asyncio.Event()
     original_wait_for_work = tracker.wait_for_work
@@ -227,7 +261,7 @@ async def test_shared_scheduler_drains_each_messages_embeddings_before_unlock(
         cast(AGFSSyncClientProtocol, agfs),
         "/queue",
         "Embedding",
-        middlewares=[TaskWorkQueueMiddleware(index)],
+        middlewares=[TaskWorkQueueMiddleware()],
     )
     enqueued = asyncio.Event()
 
@@ -296,8 +330,12 @@ async def test_shared_scheduler_drains_each_messages_embeddings_before_unlock(
         assert metadata.task_id != source.task_id
         if task:
             assert metadata.task_id == task.task_id
-        index.record_result(metadata, "completed")
-        await index.prepare_ack("Embedding", metadata)
+        await tracker.mark_work_done(
+            metadata.task_id,
+            metadata.work_id,
+            account_id=metadata.account_id,
+            user_id=metadata.user_id,
+        )
         result = await asyncio.wait_for(worker, 1)
         assert result.outcome is (
             ProcessOutcome.FAILED if fail_generation else ProcessOutcome.SUCCESS
@@ -319,6 +357,11 @@ async def test_shared_scheduler_drains_each_messages_embeddings_before_unlock(
         if payload:
             metadata = extract_task_metadata(json.loads(payload))
             if metadata:
-                index.record_result(metadata, "completed")
+                await tracker.mark_work_done(
+                    metadata.task_id,
+                    metadata.work_id,
+                    account_id=metadata.account_id,
+                    user_id=metadata.user_id,
+                )
         worker.cancel()
         await asyncio.gather(worker, return_exceptions=True)

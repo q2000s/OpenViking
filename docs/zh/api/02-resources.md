@@ -186,7 +186,8 @@ Connector 要求精确的 `to` 目标，不支持 `wait=true`。`tos://` 来源�
 | source_name | string | 否 | None | 来源显示名；上传文件省略时使用原始文件名 |
 | reason | string | 否 | "" | 添加资源的原因；非空时会随资源 URI 进入常规 session 记忆抽取链路，并在生成的记忆中记录资源引用 |
 | instruction | string | 否 | "" | 语义提取的处理指令（实验特性） |
-| wait | bool | 否 | False | 是否等待语义处理和向量化完成才返回；不支持单独的 `timeout` 参数，HTTP 超时使用客户端配置 |
+| wait | bool | 否 | False | 是否等待语义处理和向量化完成才返回 |
+| timeout | float | 否 | None | 已废弃：仅为兼容旧请求保留，传入值会被忽略；HTTP 超时使用客户端配置 |
 | strict | bool | 否 | False | 是否使用严格模式 |
 | ignore_dirs | string | 否 | None | 要忽略的目录名（逗号分隔） |
 | include | string | 否 | None | 包含的文件模式（glob） |
@@ -502,6 +503,11 @@ fmt.Println(result["task_id"])
 
 **CLI**
 
+`ov add-resource --wait` 只提交一次，再轮询任务，不设置整体等待期限。
+状态查询超时、网络错误及 HTTP 429/502/503/504 会重试；连续 10 次失败后
+退出并提供任务查询命令。Ctrl+C 仅停止等待，不取消任务，退出码为 130。
+完成后 CLI 结果保留 `task_id`。
+
 ```bash
 # 添加本地文件
 ov add-resource ./documents/guide.md --reason "User guide"
@@ -621,7 +627,7 @@ task_id      uuid-xxx
 | `errors` | array | 处理过程中的错误列表 |
 | `warnings` | array | 可选警告，包括部分处理失败或资源记忆关联失败 |
 | `queue_status` | object | 同步等待或已完成任务结果中的队列汇总，按队列返回 `processed`、`requeue_count`、`error_count` 和 `errors` |
-| `memory_linking` | object | （可选，仅当 `reason` 触发记忆生成时）本次资源 URI 与用户记忆的关联结果 |
+| `memory_linking` | object | （可选，仅当 `reason` 触发记忆生成时）本次资源 URI 与用户记忆的关联结果。`status="accepted"` 表示记忆提交已入队、尚未完成，需轮询 `/api/v1/tasks/{task_id}`（`commit_task_id`）获取结果 |
 
 **完成后的资源添加任务结果**
 

@@ -19,6 +19,7 @@ import {
 } from '../-lib/management-key'
 import { useGateway } from '../-lib/use-gateway'
 import { gatewayErrorMessage } from '../-lib/localize'
+import { DocsLink } from './docs-link'
 import { SettingField } from './setting-field'
 
 const MANAGEMENT_CONFIGS = [
@@ -91,7 +92,14 @@ export function ManagementKeyDialog() {
                 {t('management.environment')}{' '}
                 <code>OPENVIKING_GATEWAY_MANAGEMENT_KEY</code>
               </li>
+              <li>{t('management.studio')}</li>
               <li>{t('management.prefix')}</li>
+              <li>
+                {t('management.reset')}{' '}
+                <DocsLink section="lostManagementKey" variant="text">
+                  {t('management.resetDocs')}
+                </DocsLink>
+              </li>
             </ul>
           </details>
           <SettingField

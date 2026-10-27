@@ -204,7 +204,8 @@ class VLMBase(ABC):
             f"VLM provider {self.provider!r} does not support audio/video inputs"
         )
 
-    def _clean_response(self, content: str) -> str:
+    @staticmethod
+    def _clean_response(content: str) -> str:
         """Strip reasoning tags (e.g. ``<think>...</think>``) from model output."""
         return _THINK_TAG_RE.sub("", content).strip()
 
@@ -268,6 +269,7 @@ class VLMBase(ABC):
         try:
             from openviking.metrics.datasources import VLMEventDataSource
             from openviking.observability.context import get_root_observability_context
+            from openviking.telemetry import get_ingestion_source_type
 
             root_context = get_root_observability_context()
 
@@ -278,6 +280,7 @@ class VLMBase(ABC):
                 prompt_tokens=int(prompt_tokens),
                 completion_tokens=int(completion_tokens),
                 account_id=root_context.account_id if root_context is not None else None,
+                source_type=get_ingestion_source_type(),
             )
         except Exception as e:
             # Metrics must never break model inference.

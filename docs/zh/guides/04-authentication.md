@@ -51,6 +51,8 @@ curl -X POST http://localhost:1933/api/v1/admin/accounts \
 
 创建账号后，保存响应中的 `user_key`，将它用于 CLI、SDK 和数据 API。root key 不用于租户数据读写。
 
+User key 采用三段式格式 `base64url(account).base64url(user).base64url(secret)`。服务端只接受该格式；裸密钥或其他格式一律以 `401 Invalid API key` 拒绝。
+
 ### 方案二：OIDC（企业 SSO）
 
 OIDC 和 LDAP 需要可选认证依赖。在运行服务端的 Python 环境中安装：
@@ -157,6 +159,8 @@ OIDC Claims: {
 ## 完整配置参考
 
 ### OIDC 完整配置
+
+`issuer` 必须与身份提供方签发的令牌中的 `iss` 完全一致，包括末尾的 `/`。
 
 ```json
 {
@@ -728,7 +732,7 @@ ov config validate
 | GET | `/api/v1/admin/accounts` | ROOT | 列出所有工作区 |
 | DELETE | `/api/v1/admin/accounts/{id}` | ROOT | 删除工作区 |
 | POST | `/api/v1/admin/accounts/{id}/users` | ROOT, ADMIN | 注册用户 |
-| GET | `/api/v1/admin/accounts/{id}/users` | ROOT, ADMIN | 列出用户 |
+| GET | `/api/v1/admin/accounts/{id}/users` | ROOT, ADMIN, USER | 列出用户；ADMIN/USER 仅限本账户 |
 | DELETE | `/api/v1/admin/accounts/{id}/users/{uid}` | ROOT, ADMIN | 移除用户 |
 | PUT | `/api/v1/admin/accounts/{id}/users/{uid}/role` | ROOT, ADMIN | 将用户提升为 ADMIN；ADMIN 仅限本账户 |
-| POST | `/api/v1/admin/accounts/{id}/users/{uid}/key` | ROOT, ADMIN | 重新生成 user key |
+| POST | `/api/v1/admin/accounts/{id}/users/{uid}/key` | ROOT, ADMIN, USER | 重新生成 user key；USER 仅能使用个人 API Key 认证轮换自身密钥 |

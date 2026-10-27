@@ -85,6 +85,7 @@ function upstream(overrides: Partial<Upstream>): Upstream {
     base_url: 'https://api.example.com/v1',
     append_endpoint_path: true,
     auth_mode: 'managed',
+    key_header: 'authorization',
     models: [],
     aliases: {},
     priority: 0,
@@ -202,7 +203,30 @@ describe('ConnectPage', () => {
     expect(screen.getByText('https://gw.example.com/gateway/v1')).toBeTruthy()
     expect(screen.queryByText(/public_url/)).toBeNull()
     expect(linkTo('Manage keys')).toBe('/gateway/keys')
-    expect(linkTo('Full guide')).toBe(gatewayDocsUrl('guide', 'en'))
+    expect(linkTo('Full guide')).toBe(gatewayDocsUrl('claudeCode', 'en'))
+    // Each reference card links its docs section.
+    expect(
+      screen
+        .getAllByText('Learn more')
+        .map((node) => node.closest('a')?.getAttribute('href')),
+    ).toEqual([
+      gatewayDocsUrl('conversations', 'en'),
+      gatewayDocsUrl('providerKey', 'en'),
+      gatewayDocsUrl('contextHeader', 'en'),
+      gatewayDocsUrl('pluginDetected', 'en'),
+    ])
+  })
+
+  it('tells plugins apart from OpenViking MCP tools', async () => {
+    renderPage()
+    expect(
+      await screen.findByText(
+        'The gateway recognizes a plugin by the memory blocks it adds to messages. Integrations can also announce themselves with this header.',
+      ),
+    ).toBeTruthy()
+    expect(
+      screen.getByText(/^OpenViking MCP tools alone don't count/),
+    ).toBeTruthy()
   })
 
   it.each([
@@ -224,6 +248,10 @@ describe('ConnectPage', () => {
     renderPage()
     expect(await screen.findByText(title)).toBeTruthy()
     expect(screen.getAllByText('gateway.public_url')).toHaveLength(1)
+    const docs = within(screen.getByText(title).parentElement as HTMLElement)
+    expect(
+      docs.getByText('Learn more').closest('a')?.getAttribute('href'),
+    ).toBe(gatewayDocsUrl('publicAddress', 'en'))
   })
 
   it('points a standalone gateway at gateway.conf instead of ov.conf', async () => {
@@ -288,6 +316,8 @@ describe('ConnectPage', () => {
     ).toBeTruthy()
     expect(screen.queryByText(/^Add an upstream for/)).toBeNull()
     expect(screen.getByText('<model>')).toBeTruthy()
+    // The full guide opens the picked client's section.
+    expect(linkTo('Full guide')).toBe(gatewayDocsUrl('codex', 'en'))
   })
 
   it('falls back to Claude Code for an unknown client', async () => {
