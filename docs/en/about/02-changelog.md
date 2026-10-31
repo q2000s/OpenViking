@@ -33,7 +33,14 @@ This changelog is automatically generated from [GitHub Releases](https://github.
   (`mineru` or `local`) records which converter actually ran. Service-specific settings
   (`mineru_endpoint`, `mineru_token`, `mineru_bodys`) stay where they are, so a future
   remote parser is added as a provider rather than as another `strategy` value.
-
+- **Legacy session migration removed (breaking change)**: Removed the legacy
+  implementation, `ov admin migrate` (including `--cleanup`), and the corresponding
+  Python, TypeScript, and Go SDK methods. The ROOT-only `POST /api/v1/admin/migrate`
+  endpoint remains reserved and currently returns `400 / INVALID_ARGUMENT` without
+  creating a task. New releases no longer
+  provide migration or cleanup of legacy 0.3.x sessions; upgrading does not move or
+  delete those old directories. Migrated sessions and normal session operations
+  are unaffected.
 - **Gateway deployment and behavior**:
   - New standalone Helm chart, `deploy/helm/openviking-gateway`: one SQLite replica with a
     PVC, or several replicas sharing Redis. Until a release includes these features, set

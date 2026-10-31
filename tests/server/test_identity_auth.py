@@ -77,7 +77,7 @@ async def make_request(
 async def test_key_identity_and_groups_are_resolved_independently(runtime):
     key = await runtime.register_user("acme", "bob")
     await runtime.create_group("acme", "team")
-    await runtime.add_group_member("acme", "team", "bob")
+    await runtime.add_group_members("acme", "team", ["bob"])
     request = await make_request(runtime, headers=[(b"x-openviking-user", b"spoof")])
     plugin = request.app.state.auth_plugin
     identity = await plugin.resolve_identity(
@@ -99,7 +99,9 @@ async def test_key_store_error_and_unknown_identity_fail_closed():
     manager = APIKeyManager("root", store)
     request = await make_request(manager)
     key = generate_api_key("acme", "missing")
-    with pytest.raises(UnauthenticatedError, match="Unknown"):
+    with pytest.raises(
+        UnauthenticatedError, match="Account identity does not exist or is being deleted"
+    ):
         await request.app.state.auth_plugin.resolve_identity(request, api_key=key)
     store.get_user.side_effect = OSError("database offline")
     with pytest.raises(OSError, match="database offline"):
@@ -127,7 +129,7 @@ async def test_trusted_explicit_user_role_with_root_key(runtime):
 
 async def test_trusted_group_header_overrides_internal_group_lookup(runtime):
     await runtime.create_group("acme", "local-team")
-    await runtime.add_group_member("acme", "local-team", "alice")
+    await runtime.add_group_members("acme", "local-team", ["alice"])
     request = await make_request(
         runtime,
         "trusted",
@@ -147,7 +149,7 @@ async def test_trusted_group_header_overrides_internal_group_lookup(runtime):
 
 async def test_trusted_empty_group_header_falls_back_to_internal_group_lookup(runtime):
     await runtime.create_group("acme", "local-team")
-    await runtime.add_group_member("acme", "local-team", "alice")
+    await runtime.add_group_members("acme", "local-team", ["alice"])
     request = await make_request(
         runtime,
         "trusted",

@@ -15,6 +15,7 @@ from argon2 import PasswordHasher
 from argon2.exceptions import VerificationError
 from typing_extensions import deprecated
 
+from openviking.concurrency import AsyncSemaphore
 from openviking.core.identifiers import validate_identifier_length
 from openviking.pyagfs import AGFSAlreadyExistsError, AGFSNotFoundError, AsyncAGFSClient
 from openviking.pyagfs.async_client import fs_ctx_from_agfs_path
@@ -135,11 +136,11 @@ class FileStore(AccountStore):
         self._prefix_index: Dict[str, list[UserKeyEntry]] = {}
         self._user_group_ids: Dict[tuple[str, str], tuple[str, ...]] = {}
         # Serializes internal refreshes so overlapping reloads can't interleave.
-        self._reload_lock = asyncio.Lock()
+        self._reload_lock = AsyncSemaphore(1)
         # Serializes all mutations made by the unified manager in this process.
         # File locks remain responsible for inter-instance coordination.
-        self._mutation_lock = asyncio.Lock()
-        self._deletion_lock = asyncio.Lock()
+        self._mutation_lock = AsyncSemaphore(1)
+        self._deletion_lock = AsyncSemaphore(1)
 
     def _discard_account_state(self, account_id: str) -> None:
         """Remove an account and its key index entries from in-memory state."""
@@ -1086,20 +1087,24 @@ class FileStore(AccountStore):
         group = self._require_group(account_id, group_id)
         return sorted(set(group.get("members", [])))
 
-    async def _add_group_member(
-        self, account_id: str, group_id: str, user_id: str
+    async def _add_group_members(
+        self, account_id: str, group_id: str, user_ids: list[str]
     ) -> bool:
         async with self._reload_lock:
             account = self._require_account(account_id)
             await self._load_account_groups_if_needed(account_id, account)
-            if user_id not in account.users:
-                raise NotFoundError(user_id, "user")
             group = self._require_group(account_id, group_id)
-            if user_id in group.get("members", []):
+            user_ids = list(dict.fromkeys(user_ids))
+            for user_id in user_ids:
+                if user_id not in account.users:
+                    raise NotFoundError(user_id, "user")
+                if account.users[user_id].get("deletion"):
+                    raise FailedPreconditionError("User deletion is in progress")
+            members = set(group.get("members", []))
+            if members.issuperset(user_ids):
                 return True
             groups = copy.deepcopy(account.groups)
-            groups[group_id].setdefault("members", []).append(user_id)
-            groups[group_id]["members"].sort()
+            groups[group_id]["members"] = sorted(members.union(user_ids))
             await self._replace_groups(account_id, account, groups)
             return True
 
@@ -1684,11 +1689,12 @@ class FileStore(AccountStore):
         await self._ensure_account_groups_loaded(account_id)
         return self._get_user_group_ids(account_id, user_id)
 
-    async def add_group_member(
-        self, account_id: str, group_id: str, user_id: str
+    async def add_group_members(
+        self, account_id: str, group_id: str, user_ids: list[str]
     ) -> bool:
-        await self._refresh_users_for_management_read(account_id)
-        return await self._add_group_member(account_id, group_id, user_id)
+        async with self._mutation_lock:
+            await self._refresh_users_for_management_read_unlocked(account_id)
+            return await self._add_group_members(account_id, group_id, user_ids)
 
     async def remove_group_member(
         self, account_id: str, group_id: str, user_id: str

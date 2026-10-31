@@ -17,7 +17,8 @@ use super::codec::LockTokenCodec;
 use super::types::{LockToken, PathLockError, PathLockRequest, PathLockResult};
 
 /// Representation used for handles stored in a PathLock lease.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PathLockHandleMode {
     /// Handles are resolver-generated lock-file paths.
     LockPath,
@@ -65,6 +66,9 @@ pub struct AtomicAcquisitionResult {
 /// Storage abstraction for lock tokens. Only `PathLockManager` should call these methods.
 #[async_trait]
 pub trait PathLockProvider: Send + Sync {
+    /// Add provider-owned observations to the manager's metrics snapshot.
+    fn update_metrics(&self, _metrics: &mut super::metrics::LockMetrics) {}
+
     /// Human-readable provider name for config/logging/metrics.
     fn name(&self) -> &'static str;
 
